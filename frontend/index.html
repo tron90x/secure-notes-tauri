@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SecureNotes — Coffre chiffré</title>
+<link rel="stylesheet" href="styles.css" />
+<script src="lang.js"></script>
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<canvas id="particles"></canvas>
+<div class="bg-orbs"><div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div></div>
+
+<!-- SPLASH -->
+<div id="splash" class="splash">
+  <div class="splash-logo">🔐</div>
+  <h1 class="splash-title">Secure<span>Notes</span></h1>
+  <div class="splash-bar"><div class="splash-fill"></div></div>
+  <p class="splash-sub" data-i18n="splash_sub">Chiffrement AES-256-GCM • Argon2id • Zéro-connaissance</p>
+</div>
+
+<!-- VAULT -->
+<div id="vaultView" class="view hidden">
+  <div class="vault-card glass">
+    <div class="row lang-row">
+      <span class="muted">🌍</span>
+      <button id="langFr" data-lang-btn="fr" class="btn small ghost">Français</button>
+      <button id="langKab" data-lang-btn="kab" class="btn small ghost">Taqbaylit</button>
+    </div>
+    <h2 data-i18n="vault_title">🔐 Vos coffres chiffrés</h2>
+    <p class="muted" data-i18n="vault_desc">Chaque base <b>.snotevault</b> est chiffrée intégralement (AES-256-GCM, clé Argon2id).</p>
+    <div class="row">
+      <select id="vaultSelect"></select>
+      <button id="refreshVaults" class="btn ghost">↻</button>
+    </div>
+    <input id="unlockPass" type="password" data-i18n-ph="unlock_pass_ph" placeholder="Mot de passe de la base" />
+    <button id="unlockBtn" class="btn primary" data-i18n="unlock_btn">Déchiffrer & Ouvrir ✨</button>
+    <hr />
+    <h3 data-i18n="new_vault">Créer une nouvelle base</h3>
+    <input id="newVaultName" data-i18n-ph="vault_name_ph" placeholder="Nom de la base (ex: Perso)" />
+    <input id="newVaultPass" type="password" data-i18n-ph="vault_pass_ph" placeholder="Mot de passe fort (min 8 caractères)" />
+    <div class="strength"><div id="vaultStrengthBar"></div></div>
+    <span id="vaultStrengthTxt" class="muted"></span>
+    <button id="createVaultBtn" class="btn secondary" data-i18n="create_btn">＋ Créer la base chiffrée</button>
+    <p id="vaultMsg" class="msg"></p>
+  </div>
+</div>
+
+<!-- MAIN -->
+<div id="mainView" class="view hidden">
+  <header class="topbar glass">
+    <div class="brand">🔐 Secure<span>Notes</span></div>
+    <div class="searchbar">
+      <input id="q" placeholder="🔍 Recherche avancée : mots-clés..." data-i18n-ph="search_ph" />
+      <input id="dfrom" type="date" title="Date début" />
+      <input id="dto" type="date" title="Date fin" />
+      <button id="searchBtn" class="btn small primary" data-i18n="search_btn">Rechercher</button>
+      <button id="clearSearchBtn" class="btn small ghost" data-i18n="clear_btn">Effacer</button>
+    </div>
+    <div id="tagBar" class="tagbar"></div>
+    <button id="graphBtn" class="btn ghost" data-i18n="graph_btn">🕸 Graphe</button>
+    <button id="backupBtn" class="btn ghost">📦</button>
+    <button id="dashBtn" class="btn ghost" data-i18n="dashboard_btn">📊 Dashboard</button>
+    <button id="lockBtn" class="btn ghost" data-i18n="lock_btn">🔒 Verrouiller</button>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar glass">
+      <h3 data-i18n="profiles_title">👤 Profils</h3>
+      <div class="row"><input id="profileName" placeholder="Nouveau profil..." data-i18n-ph="new_profile_ph" /><button id="addProfileBtn" class="btn small primary">＋</button></div>
+      <div id="profileList"></div>
+      <button id="showTrashBtn" class="btn small ghost" data-i18n="trash_btn">🗑 Corbeille (<span id="trashCount">0</span>)</button>
+      <div class="row auto-lock-row"><label class="muted" for="autoLock" data-i18n="auto_lock_label">🔒 Verrou auto</label><select id="autoLock">
+        <option value="60">1 min</option><option value="300" selected>5 min</option>
+        <option value="900">15 min</option><option value="1800">30 min</option><option value="3600">1 h</option>
+      </select></div>
+    </aside>
+
+    <main class="content">
+      <div class="content-head">
+        <h2 id="currentProfileTitle">Sélectionnez un profil</h2>
+        <div class="row">
+          <button id="emptyTrashBtn" class="btn small danger hidden">Vider la corbeille</button>
+          <button id="newNoteBtn" class="btn primary" data-i18n="new_note_btn">＋ Nouvelle note</button>
+        </div>
+      </div>
+      <div id="notesGrid" class="grid"></div>
+    </main>
+  </div>
+</div>
+
+<!-- MODAL NOTE -->
+<div id="noteModal" class="modal hidden">
+  <div class="modal-card glass">
+    <h3 id="modalTitle">Nouvelle note</h3>
+    <input id="noteTitle" placeholder="Titre de la note" data-i18n-ph="note_title_ph" />
+    <textarea id="noteContent" rows="7" placeholder="Contenu... (astuce : [[Titre d'une note]] crée un lien)" data-i18n-ph="note_content_ph"></textarea>
+    <div class="row" id="insertBar" style="gap:6px;flex-wrap:wrap;margin:6px 0">
+      <button type="button" class="btn small ghost" data-insert="link" data-i18n-title="ins_link" title="Insérer un lien [[Titre]]">⟦⟧</button>
+      <button type="button" class="btn small ghost" data-insert="person" data-i18n-title="ins_person" title="Insérer une personne @nom">@</button>
+      <button type="button" class="btn small ghost" data-insert="place" data-i18n-title="ins_place" title="Insérer un lieu 📍nom">📍</button>
+      <button type="button" class="btn small ghost" data-insert="idea" data-i18n-title="ins_idea" title="Insérer une idée 💡nom">💡</button>
+      <button type="button" class="btn small ghost" data-insert="date" data-i18n-title="ins_date" title="Insérer la date du jour AAAA-MM-JJ">📅</button>
+      <button type="button" class="btn small ghost" data-insert="lieu" data-i18n-title="ins_lieu" title="Insérer #lieu/nom">#lieu/</button>
+      <button type="button" class="btn small ghost" data-insert="idee" data-i18n-title="ins_idee" title="Insérer #idée/nom">#idée/</button>
+    </div>
+    <div class="tag-editor">
+      <div id="tagPills" class="tag-pills"></div>
+      <input id="tagInput" placeholder="+ tag (Entrée pour ajouter)" data-i18n-ph="tag_input_ph" />
+    </div>
+    <div class="row">
+      <input id="notePass" type="password" placeholder="🔒 Mot de passe individuel (optionnel)" data-i18n-ph="note_pass_ph" />
+    </div>
+    <div class="row">
+      <label><span data-i18n="wallpaper_label">Fond :</span> <select id="noteWallpaper">
+        <option value="aurora">Aurora</option><option value="sunset">Sunset</option>
+        <option value="ocean">Ocean</option><option value="neon">Néon</option>
+        <option value="sakura">Sakura</option><option value="carbon">Carbon</option>
+      </select></label>
+      <label class="chk"><input type="checkbox" id="noteGlass" checked /> <span data-i18n="glass_label">Effet glass ✨</span></label>
+    </div>
+    <div class="row">
+      <input type="file" id="noteFile" data-i18n-title="file_title" title="Choisir un fichier" />
+      <span id="fileHint" class="muted"></span>
+    </div>
+    <div class="row end">
+      <button id="cancelNoteBtn" class="btn ghost" data-i18n="cancel_btn">Annuler</button>
+      <button id="saveNoteBtn" class="btn primary" data-i18n="save_btn">💾 Enregistrer (chiffré)</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL VIEW -->
+<div id="viewModal" class="modal hidden">
+  <div class="modal-card glass" id="viewCard">
+    <h3 id="vTitle"></h3>
+    <details class="dates-dropdown">
+      <summary>🕓 Dates : création & modifications</summary>
+      <div id="vMeta" class="muted dates-body"></div>
+    </details>
+    <div class="note-focus-wrap">
+      <div id="vContent" class="note-content"></div>
+    <div id="vTags" class="tag-pills view-tags"></div>
+      <button id="expandBtn" class="expand-btn" title="Agrandir la lecture">＋</button>
+    </div>
+    <div class="hl-toolbar">
+      <span class="muted" data-i18n="hl_hint">🖍 Sélectionnez un mot/phrase puis :</span>
+      <div class="hl-colors">
+        <button class="hl-dot hl-yellow" data-color="yellow" title="Jaune">●</button>
+        <button class="hl-dot hl-green" data-color="green" title="Vert">●</button>
+        <button class="hl-dot hl-pink" data-color="pink" title="Rose">●</button>
+        <button class="hl-dot hl-blue" data-color="blue" title="Bleu">●</button>
+        <button class="hl-dot hl-orange" data-color="orange" title="Orange">●</button>
+      </div>
+      <button id="clearHlBtn" class="btn small ghost" title="Cliquez sur un surlignage existant pour le supprimer" data-i18n="clear_hl_btn" data-i18n-title="clear_hl_btn">🧽 Cliquez sur un surlignage pour le retirer</button>
+    </div>
+    <div id="vAttach"></div>
+    <details class="dates-dropdown">
+      <summary id="vVerSum" data-i18n="versions_prev">📜 Versions précédentes</summary>
+      <div id="vVersions"></div>
+    </details>
+    <div class="row end">
+      <button id="closeViewBtn" class="btn ghost" data-i18n="close_btn">✕ Fermer</button>
+      <button id="editViewBtn" class="btn secondary" data-i18n="edit_btn">✏️ Modifier</button>
+      <button id="delViewBtn" class="btn danger" data-i18n="del_btn">🗑 Corbeille</button>
+    </div>
+  </div>
+</div>
+<!-- LECTURE AGRANDIE -->
+<div id="focusModal" class="modal hidden">
+  <div class="modal-card focus-card" id="focusCard">
+    <h3 id="fTitle"></h3>
+    <div id="focusContent" class="note-content focus-content"></div>
+    <div class="row end">
+      <button id="closeFocusBtn" class="btn ghost">✕ Réduire</button>
+    </div>
+  </div>
+</div>
+<!-- MODALE SYSTÈME (alert / confirm / prompt) -->
+<div id="sysModal" class="modal hidden">
+  <div class="modal-card glass sys-card">
+    <h3 id="sysTitle"></h3>
+    <p id="sysMsg" class="sys-msg"></p>
+    <input id="sysInput" class="hidden" />
+    <div class="row end">
+      <button id="sysCancel" class="btn ghost" data-i18n="cancel_btn">Annuler</button>
+      <button id="sysOk" class="btn primary">OK</button>
+    </div>
+  </div>
+</div>
+<!-- DASHBOARD -->
+<div id="dashModal" class="modal hidden">
+  <div class="modal-card glass dash-card">
+    <div class="row dash-head">
+      <h2 data-i18n="dashboard_btn">📊 Dashboard</h2>
+      <button id="closeDashBtn" class="btn ghost" data-i18n="close_btn">✕ Fermer</button>
+    </div>
+    <div id="dashKpis" class="kpis"></div>
+    <div class="dash-grid">
+      <div class="dash-panel"><h4 data-i18n="dash_notes_by_profile">📁 Notes par profil</h4><div id="dashProfiles"></div></div>
+      <div class="dash-panel"><h4 data-i18n="dash_locked_vs_free">🔒 Verrouillées vs libres</h4>
+        <canvas id="dashDonut"></canvas><div id="dashDonutLegend" class="muted legend"></div>
+      </div>
+      <div class="dash-panel wide"><h4 data-i18n="dash_activity_30d">📈 Activité — 30 derniers jours</h4>
+        <canvas id="dashActivity"></canvas><div class="muted legend" data-i18n="dash_activity_legend">🟦 créations • 🟪 modifications</div>
+      </div>
+      <div class="dash-panel"><h4>🔥 Streak d'écriture</h4><div id="dashStreak"></div>
+        <div class="row goal-row"><input id="goalInput" type="number" min="0" max="10000" placeholder="Objectif mots/jour" /><button id="goalSaveBtn" class="btn small secondary">OK</button></div>
+      </div>
+      <div class="dash-panel"><h4 data-i18n="dash_tag_cloud">🏷 Nuage de tags</h4><div id="dashTags" class="tag-cloud"></div></div>
+      <div class="dash-panel"><h4 data-i18n="dash_highlights_color">🖍 Surlignages par couleur</h4><div id="dashColors"></div></div>
+      <div class="dash-panel"><h4 data-i18n="dash_wallpapers">🎨 Fonds d'écran</h4><div id="dashWalls"></div></div>
+      <div class="dash-panel wide"><h4 data-i18n="dash_heatmap_title">🗓 Heatmap d'activité — 12 semaines</h4><div id="dashHeat" class="heat"></div></div>
+      <div class="dash-panel wide"><h4 data-i18n="dash_top_title">🏆 Plus longues notes</h4><div id="dashTop"></div></div>
+      <div class="dash-panel wide"><h4 data-i18n="dash_security">🛡 Sécurité du coffre</h4><div id="dashSec" class="muted sec-grid"></div></div>
+    </div>
+  </div>
+</div>
+<!-- GRAPHE DE LIENS -->
+<div id="graphModal" class="modal hidden">
+  <div class="modal-card glass dash-card">
+    <div class="row dash-head">
+      <h2><span data-i18n="graph_btn">🕸 Graphe</span> <span class="muted" style="font-size:13px">— cliquez un nœud pour ouvrir • glissez pour déplacer</span></h2>
+      <button id="closeGraphBtn" class="btn ghost" data-i18n="close_btn">✕ Fermer</button>
+    </div>
+    <p class="muted"><span data-i18n="graph_hint">Liens <b>[[Titre]]</b> entre notes (les verrouillées sont exclues).</span> <span id="graphInfo"></span></p>
+    <div class="row" id="graphLayers" style="gap:6px;margin-bottom:8px;flex-wrap:wrap">
+      <button class="tag-pill active" data-graph-mode="all" data-i18n="graph_all">Tout</button>
+      <button class="tag-pill" data-graph-mode="notes" data-i18n="graph_notes">Notes</button>
+      <button class="tag-pill" data-graph-mode="tags" data-i18n="graph_tags">Tags</button>
+      <button class="tag-pill" data-graph-mode="persons" data-i18n="graph_persons">@Pers</button>
+      <button class="tag-pill" data-graph-mode="places" data-i18n="graph_places">📍Lieux</button>
+      <button class="tag-pill" data-graph-mode="ideas" data-i18n="graph_ideas">💡Idées</button>
+      <button class="tag-pill" data-graph-mode="dates" data-i18n="graph_dates">📅 Dates</button>
+    </div>
+    <div class="graph-wrap"><canvas id="graphCanvas"></canvas><div id="graphTip" class="graph-tip hidden"></div></div>
+  </div>
+</div>
+<!-- BACKUPS -->
+<div id="backupModal" class="modal hidden">
+  <div class="modal-card glass sys-card" style="max-width:520px">
+    <h3 data-i18n="backup_title">📦 Sauvegardes chiffrées</h3>
+    <p class="muted">Copies horodatées du coffre (déjà chiffré), 10 max, +1 auto/heure à l'ouverture.</p>
+    <div id="backupList"></div>
+    <div class="row end">
+      <button id="closeBackupBtn" class="btn ghost" data-i18n="close_btn">✕ Fermer</button>
+      <button id="doBackupBtn" class="btn primary" data-i18n="backup_now">📦 Sauvegarder maintenant</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>

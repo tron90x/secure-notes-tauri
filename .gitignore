@@ -1,0 +1,8 @@
+# Dépendances & build
+node_modules/
+src-tauri/target/
+
+# Coffres chiffrés, sauvegardes et secrets : NE JAMAIS COMMITER
+*.snotevault
+*.log
+.env
