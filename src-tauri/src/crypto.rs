@@ -29,6 +29,9 @@ pub fn encrypt_aes_gcm(key: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, Vec
 }
 
 pub fn decrypt_aes_gcm(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    if nonce.len() != 12 {
+        return Err("Nonce invalide : fichier corrompu".into());
+    }
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
     let nonce = Nonce::from_slice(nonce);
     cipher.decrypt(nonce, ciphertext).map_err(|_| "Mot de passe incorrect ou fichier corrompu".to_string())
@@ -58,6 +61,13 @@ mod tests {
         let (nonce, mut ct) = encrypt_aes_gcm(&key, "intègre".as_bytes()).unwrap();
         ct[0] ^= 0xFF;
         assert!(decrypt_aes_gcm(&key, &nonce, &ct).is_err());
+    }
+
+    #[test]
+    fn malformed_nonce_returns_error_without_panicking() {
+        for len in [0, 1, 11, 13, 32] {
+            assert!(decrypt_aes_gcm(&[0; 32], &vec![0; len], b"invalid").is_err());
+        }
     }
 
     #[test]

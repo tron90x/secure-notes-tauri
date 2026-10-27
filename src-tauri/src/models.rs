@@ -17,13 +17,26 @@ pub struct VaultFile {
     pub decoy_ciphertext: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Database {
     pub profiles: Vec<Profile>,
     pub notes: Vec<Note>,
     /// Objectif de mots par jour (0 = désactivé).
     #[serde(default)]
     pub daily_goal_words: usize,
+    /// None pour les anciennes bases, initialisées lors de la prochaine écriture.
+    #[serde(default)]
+    pub daily_word_counts: Option<std::collections::HashMap<String, usize>>,
+    #[serde(default)]
+    pub drafts: Vec<NoteDraft>,
+    #[serde(default)]
+    pub smart_folders: Vec<SmartFolder>,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self { profiles: vec![], notes: vec![], daily_goal_words: 0, daily_word_counts: Some(std::collections::HashMap::new()), drafts: vec![], smart_folders: vec![] }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,18 +65,23 @@ pub struct NoteVersion {
 pub struct Note {
     pub id: String,
     pub profile_id: String,
+    #[serde(default)]
+    pub revision: u64,
     pub title: String,
     /// Si locked = false : content en clair (mais DB globale chiffrée).
-    /// Si locked = true : content = "" et payload_chiffre contient le contenu chiffré avec note_password.
+    /// Si locked = true : payload chiffré individuel ; voir locked_format pour la compatibilité.
     pub content: String,
     pub is_locked: bool,
     pub locked_nonce: Option<String>,
     pub locked_payload: Option<String>,
     pub locked_salt: Option<String>,
+    /// 0 : contenu seul, 1 : titre/contenu/pièce jointe, 2 : inclut tags, versions et surlignages.
+    #[serde(default)]
+    pub locked_format: u32,
     pub created_at: DateTime<Utc>,
     pub modified_history: Vec<DateTime<Utc>>,
     pub attachment_name: Option<String>,
-    pub attachment_data: Option<String>, // base64 (chiffré via DB globale, donc ok)
+    pub attachment_data: Option<String>, // base64 ; déplacé dans le payload si verrouillée
     pub wallpaper: String, // clé : aurora, sunset, ocean, neon, carbon, sakura...
     pub glass: bool,
     #[serde(default)]
@@ -79,7 +97,51 @@ pub struct Note {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProtectedNote {
+    pub title: String,
+    pub content: String,
+    pub attachment_name: Option<String>,
+    pub attachment_data: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub versions: Vec<NoteVersion>,
+    #[serde(default)]
+    pub highlights: Vec<Highlight>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteDraft {
+    pub id: String,
+    pub note_id: Option<String>,
+    pub profile_id: String,
+    pub base_revision: u64,
+    pub updated_at: DateTime<Utc>,
+    pub protected: bool,
+    pub salt: Option<String>,
+    pub nonce: String,
+    pub ciphertext: String,
+}
+
+impl Note {
+    /// Les anciennes notes ne doivent pas divulguer leurs métadonnées via IPC.
+    pub fn for_client(&self) -> Self {
+        let mut note = self.clone();
+        if note.is_locked {
+            note.title.clear();
+            note.content.clear();
+            note.attachment_name = None;
+            note.attachment_data = None;
+            note.tags.clear();
+            note.versions.clear();
+            note.highlights.clear();
+        }
+        note
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SearchParams {
     pub query: Option<String>,
     pub profile_id: Option<String>,
@@ -87,6 +149,15 @@ pub struct SearchParams {
     pub date_to: Option<DateTime<Utc>>,
     #[serde(default)]
     pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartFolder {
+    pub id: String,
+    pub name: String,
+    pub params: SearchParams,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 // ---------- Dashboard ----------
@@ -223,5 +294,17 @@ mod tests {
         assert!(n.highlights.is_empty());
         assert!(n.versions.is_empty());
         assert!(n.trashed_at.is_none());
+        assert_eq!(n.revision, 0);
+    }
+
+    #[test]
+    fn old_databases_and_protected_payloads_accept_new_editor_fields() {
+        let db: Database = serde_json::from_str(r#"{"profiles":[],"notes":[]}"#).unwrap();
+        assert!(db.drafts.is_empty());
+        assert!(db.smart_folders.is_empty());
+        let payload: ProtectedNote = serde_json::from_str(r#"{"title":"T","content":"C","attachment_name":null,"attachment_data":null}"#).unwrap();
+        assert!(payload.tags.is_empty());
+        assert!(payload.versions.is_empty());
+        assert!(payload.highlights.is_empty());
     }
 }

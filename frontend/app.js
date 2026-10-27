@@ -2,8 +2,14 @@ async function invoke(cmd, args = {}) {
   // Attend que le bridge Tauri soit injecté (avec withGlobalTauri:true)
   for (let i = 0; i < 50 && !(window.__TAURI__ && window.__TAURI__.core); i++)
     await new Promise(r => setTimeout(r, 100));
-  if (!window.__TAURI__?.core) throw "Bridge Tauri introuvable — relancez avec `npx tauri dev` (pas en navigateur)";
-  return window.__TAURI__.core.invoke(cmd, args);
+  if (!window.__TAURI__?.core) throw t("bridge_missing");
+  try { return await window.__TAURI__.core.invoke(cmd, args); }
+  catch (error) {
+    // Garder les erreurs de session brutes pour sessionError(), qui masque immédiatement le coffre.
+    const message = String(error?.message || error);
+    if (message.startsWith("Coffre verrouillé") || message.startsWith("Session expirée")) throw error;
+    throw localizeError(error);
+  }
 }
 
 const $ = (id) => document.getElementById(id);
@@ -11,38 +17,52 @@ let profiles = [], currentProfile = null, currentNotes = [], editingId = null, v
 let showingTrash = false, idleSecs = 300, idleTimer = null;
 let selectedTag = null, pendingTags = [];
 let decoyVisible = false; // carré leurre masqué par défaut (Ctrl+L pour l'afficher)
+let commandCenter = null;
+let organizationCenter = null, notesViewEpoch = 0;
+let transferCenter = null;
 
 // --- Modale système : remplace alert / confirm / prompt natifs ---
-function sysDialog({ title, msg, input = false, password = false, okText = null, showCancel = true }) {
+function sysDialog({ title, msg, input = false, password = false, okText = null, showCancel = true, value = "", readonly = false }) {
   return new Promise((resolve) => {
     $("sysTitle").textContent = title;
     $("sysMsg").textContent = msg || "";
     const inp = $("sysInput");
     inp.classList.toggle("hidden", !input);
-    if (input) { inp.value = ""; inp.type = password ? "password" : "text"; inp.placeholder = password ? "Mot de passe..." : "Votre saisie..."; }
+    inp.readOnly = readonly;
+    if (input) { inp.value = value; inp.type = password ? "password" : "text"; inp.placeholder = t(password ? "password_ph" : "input_ph"); }
     $("sysOk").textContent = okText ?? (typeof t === "function" ? t("ok_btn") : "OK");
     $("sysCancel").style.display = showCancel ? "" : "none";
     $("sysModal").classList.remove("hidden");
-    if (input) setTimeout(() => inp.focus(), 60);
+    if (input) setTimeout(() => { inp.focus(); if (readonly) inp.select(); }, 60);
     const done = (val) => {
       $("sysModal").classList.add("hidden");
+      inp.value = "";
+      inp.readOnly = false;
       $("sysOk").onclick = $("sysCancel").onclick = inp.onkeydown = null;
+      $("sysModal").onkeydown = null;
       resolve(val);
     };
     $("sysOk").onclick = () => done(input ? { ok: true, value: inp.value } : { ok: true });
     $("sysCancel").onclick = () => done({ ok: false });
     inp.onkeydown = (e) => { if (e.key === "Enter") $("sysOk").click(); };
+    $("sysModal").onkeydown = e => {
+      if (e.key === "Escape" && (showCancel || readonly)) {
+        e.preventDefault();
+        e.stopPropagation();
+        $("sysCancel").click();
+      }
+    };
   });
 }
-const sysAlert = (msg, title = "ℹ️ Info") => sysDialog({ title, msg, showCancel: false });
-const sysConfirm = (msg, title = "❓ Confirmer", okText = "Confirmer") => sysDialog({ title, msg, okText });
-const sysPrompt = (msg, title = "🔒 Saisie", password = false) => sysDialog({ title, msg, input: true, password });
+const sysAlert = (msg, title = t("info_title")) => sysDialog({ title, msg, showCancel: false });
+const sysConfirm = (msg, title = t("confirm_title"), okText = t("confirm_btn")) => sysDialog({ title, msg, okText });
+const sysPrompt = (msg, title = t("input_title"), password = false) => sysDialog({ title, msg, input: true, password });
 
 // Erreur de session (verrouillée / expirée) → retour à l'écran des coffres
 async function sessionError(e) {
   const s = String(e && (e.message || e));
-  if (s.includes("verrouillé") || s.includes("expirée") || s.includes("Session")) {
-    await sysAlert(s + " — reconnectez-vous.", "🔒 Session terminée");
+  if (s.startsWith("Coffre verrouillé") || s.startsWith("Session expirée")) {
+    concealSession();
     location.reload();
     return true;
   }
@@ -66,6 +86,9 @@ function refreshDynamicTexts(){
   if (!currentProfile && !showingTrash) $("currentProfileTitle").textContent = t("select_profile");
   if ($("noteModal").classList.contains("hidden") || !editingId) $("modalTitle").textContent = t("modal_new");
   if (typeof viewingNote !== "undefined" && viewingNote) renderVersions();
+  const emptyVault = $("vaultSelect").querySelector?.('option[value=""]');
+  if (emptyVault) emptyVault.textContent = t("no_vault");
+  $("newVaultPass").oninput?.({ target: $("newVaultPass") });
 }
 $("langFr").onclick = () => { setLang("fr"); refreshDynamicTexts(); };
 $("langKab").onclick = () => { setLang("kab"); refreshDynamicTexts(); };
@@ -111,7 +134,7 @@ $("createVaultBtn").onclick = async () => {
   const name = $("newVaultName").value.trim(), pass = $("newVaultPass").value;
   const btn = $("createVaultBtn");
   btn.disabled = true; btn.textContent = t("create_busy");
-  try { await invoke("create_vault", { name, password: pass }); $("vaultMsg").textContent = "✅ Base créée et déchiffrée !"; enterMain(); }
+  try { await invoke("create_vault", { name, password: pass }); $("vaultMsg").textContent = tr("vault_created"); await enterMain(); }
   catch(e){ $("vaultMsg").textContent = "❌ " + e; }
   finally { btn.disabled = false; btn.textContent = t("create_btn"); }
 };
@@ -120,12 +143,34 @@ $("unlockBtn").onclick = async () => {
   if(!path) return $("vaultMsg").textContent = t("select_base");
   const btn = $("unlockBtn");
   btn.disabled = true; btn.textContent = t("unlock_busy");
-  try { const name = await invoke("unlock_vault", { path, password }); $("vaultMsg").textContent = "✅ " + name + " déchiffré"; enterMain(); }
+  try { const name = await invoke("unlock_vault", { path, password }); $("vaultMsg").textContent = tr("vault_unlocked", { name }); await enterMain(); }
   catch(e){ $("vaultMsg").textContent = "❌ " + e; }
   finally { btn.disabled = false; btn.textContent = t("unlock_btn"); }
 };
 
 async function enterMain(){
+  $("newVaultPass").value = "";
+  $("unlockPass").value = "";
+  if (window.__TAURI__?.event) {
+    await window.__TAURI__.event.listen("vault-locked", () => { concealSession(); location.reload(); });
+  }
+  if (window.__TAURI__?.window) {
+    const appWindow = window.__TAURI__.window.getCurrentWindow();
+    let closing = false;
+    await appWindow.onCloseRequested(async event => {
+      if (closing) { event.preventDefault(); return; }
+      if (transferCenter?.isBusy()) { event.preventDefault(); return; }
+      if (!editorSession && !commandCenter?.hasCapture()) return;
+      event.preventDefault();
+      closing = true;
+      try {
+        if (commandCenter?.hasCapture() && !await commandCenter.finishCapture(false)) return;
+        if (editorSession && !await finishEditor(false)) return;
+        await appWindow.destroy();
+      }
+      finally { closing = false; }
+    });
+  }
   $("vaultView").classList.add("hidden");
   $("mainView").classList.remove("hidden");
   try {
@@ -136,18 +181,57 @@ async function enterMain(){
   await loadProfiles();
   await refreshTrashCount();
   refreshTagBar();
+  refreshDraftCount();
+  organizationCenter?.refreshFolders();
+  await commandCenter?.onUnlocked();
 }
-$("lockBtn").onclick = async () => { await invoke("lock_vault"); location.reload(); };
+$("lockBtn").onclick = lockAndReload;
+
+async function lockAndReload() {
+  const snapshot = editorSession && editorChange > editorSaved && validEditorPassword() ? editorSnapshot(false) : null;
+  const capture = commandCenter?.snapshotForLock();
+  const pending = Promise.all([snapshot, capture].filter(Boolean).map(params => invoke("save_note_editor", { params }).catch(() => {})));
+  concealSession();
+  try { await pending; await invoke("lock_vault"); }
+  catch (e) { /* Le backend applique également l'expiration indépendamment de l'UI. */ }
+  finally { location.reload(); }
+}
+
+function concealSession() {
+  notesViewEpoch++;
+  clearTimeout(idleTimer);
+  idleTimer = null;
+  clearReading();
+  resetNoteForm({ release: false });
+  commandCenter?.clear({ release: false });
+  organizationCenter?.clear();
+  transferCenter?.clear({ release: false });
+  for (const id of ["mainView", "noteModal", "sysModal", "dashModal", "graphModal", "backupModal", "draftsModal"]) $(id).classList.add("hidden");
+  $("sysInput").value = "";
+  $("notesGrid").innerHTML = "";
+  $("profileList").innerHTML = "";
+  currentNotes = [];
+  profiles = [];
+  currentProfile = null;
+}
 
 // Verrouillage automatique après inactivité (le backend applique aussi ce délai)
 function resetIdle(){
   clearTimeout(idleTimer);
-  idleTimer = setTimeout(async () => {
-    try { await invoke("lock_vault"); } catch(e) {}
-    location.reload();
-  }, idleSecs * 1000);
+  idleTimer = setTimeout(lockAndReload, idleSecs * 1000);
 }
-["click", "keydown"].forEach(ev => addEventListener(ev, () => { if (!$("mainView").classList.contains("hidden")) resetIdle(); }, { passive: true }));
+let lastActivitySent = 0, activityPending = false;
+async function recordActivity() {
+  if ($("mainView").classList.contains("hidden")) return;
+  resetIdle();
+  if (activityPending || Date.now() - lastActivitySent < 5000) return;
+  activityPending = true;
+  lastActivitySent = Date.now();
+  try { await invoke("touch_session"); }
+  catch (e) { await sessionError(e); }
+  finally { activityPending = false; }
+}
+["click", "keydown", "pointermove", "wheel", "input"].forEach(ev => addEventListener(ev, recordActivity, { passive: true }));
 $("autoLock").onchange = async (e) => {
   try {
     idleSecs = await invoke("set_auto_lock_timeout", { secs: Number(e.target.value) });
@@ -160,22 +244,29 @@ $("autoLock").onchange = async (e) => {
 async function loadProfiles(){
   try {
     profiles = await invoke("list_profiles");
-  } catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
+  } catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return false; }
+  renderProfiles();
+  return true;
+}
+
+function renderProfiles() {
   const box = $("profileList"); box.innerHTML = "";
   for(const p of profiles){
     const d = document.createElement("div");
     d.className = "profile-item" + (currentProfile?.id === p.id ? " active" : "");
-    d.innerHTML = `👤 <b>${p.name}</b><small>créé le ${new Date(p.created_at).toLocaleString()}</small> <button data-del="${p.id}" style="float:right;background:none;border:none;cursor:pointer">🗑</button>`;
+    d.innerHTML = `👤 <b>${esc(p.name)}</b><small>${esc(tr("created_on", { date: new Date(p.created_at).toLocaleString() }))}</small> <button data-del="${esc(p.id)}" title="${esc(t("profile_delete_title"))}" style="float:right;background:none;border:none;cursor:pointer">🗑</button>`;
     d.onclick = (e) => { if(e.target.dataset.del) return delProfile(e.target.dataset.del); currentProfile = p; exitTrashMode(); loadProfiles(); loadNotes(); };
     box.appendChild(d);
   }
 }
 async function delProfile(id){
-  const c = await sysConfirm("Supprimer ce profil ? Ses notes seront placées dans la corbeille (récupérables).", "🗑 Supprimer le profil");
+  const c = await sysConfirm(t("profile_delete_confirm"), t("profile_delete_title"));
   if(!c.ok) return;
   try { await invoke("delete_profile", { id }); } catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
   if(currentProfile?.id===id) currentProfile=null;
-  loadProfiles(); $("notesGrid").innerHTML=""; refreshTrashCount();
+  await loadProfiles(); await refreshTrashCount();
+  if (organizationCenter?.activeFolderId()) await refreshCurrentNotesView();
+  else $("notesGrid").innerHTML = "";
 }
 $("addProfileBtn").onclick = async () => {
   const name = $("profileName").value.trim(); if(!name) return;
@@ -185,28 +276,33 @@ $("addProfileBtn").onclick = async () => {
 
 // notes
 async function loadNotes(){
+  const epoch = ++notesViewEpoch;
+  organizationCenter?.leaveFolder();
   if(!currentProfile) return $("currentProfileTitle").textContent = t("select_profile");
   exitTrashMode();
   $("currentProfileTitle").textContent = "📁 " + currentProfile.name;
   try {
-    currentNotes = await invoke("list_notes", { profileId: currentProfile.id });
+    const notes = await invoke("list_notes", { profileId: currentProfile.id });
+    if (epoch !== notesViewEpoch) return;
+    currentNotes = notes;
   } catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
   selectedTag = null;
   renderNotes(currentNotes);
   refreshTagBar();
+  organizationCenter?.refreshFolders();
 }
 function renderNotes(notes){
   const g = $("notesGrid"); g.innerHTML = ""; g.onclick = null;
-  if(!notes.length) g.innerHTML = `<p class="muted">Aucune note. Créez-en une ✨</p>`;
+  if(!notes.length) g.innerHTML = `<p class="muted">${esc(t("notes_empty"))}</p>`;
   for(const n of notes){
     const c = document.createElement("div");
     c.className = `note-card wp-${n.wallpaper||"aurora"} ${n.glass?"glassy":""}`;
     // Notes verrouillées : titre + contenu + pièce jointe masqués dans la grille.
-    const title = n.is_locked ? "🔒 Note verrouillée" : n.title;
-    const prev = n.is_locked ? "Note chiffrée individuellement — cliquez pour déchiffrer" : (n.content||"").slice(0,120);
-    const attach = (!n.is_locked && n.attachment_name) ? ` • 📎 ${n.attachment_name}` : (n.is_locked ? ` • 📎 pièce jointe` : "");
-    c.innerHTML = `<h4>${title}</h4><p>${prev}</p>
-      <div class="meta">📅 ${new Date(n.created_at).toLocaleString()}${n.modified_history.length?` • ✏️ ${n.modified_history.length} modif`:""}${attach}</div>`;
+    const title = n.is_locked ? "🔒 " + t("commands_locked") : n.title;
+    const prev = n.is_locked ? t("locked_preview") : notePreview(n.content || "").slice(0,120);
+    const attach = (!n.is_locked && n.attachment_name) ? ` • 📎 ${esc(n.attachment_name)}` : "";
+    c.innerHTML = `<h4>${esc(title)}</h4><p>${esc(prev)}</p>
+      <div class="meta">📅 ${new Date(n.created_at).toLocaleString()}${n.modified_history.length?` • ✏️ ${esc(tr("modifications_count", { count: n.modified_history.length }))}`:""}${attach}</div>`;
     c.onclick = () => viewNote(currentNotes.find(x => x.id === n.id) ?? n);
     g.appendChild(c);
   }
@@ -220,6 +316,8 @@ function exitTrashMode(){
 }
 $("showTrashBtn").onclick = () => loadTrash();
 async function loadTrash(){
+  const epoch = ++notesViewEpoch;
+  organizationCenter?.leaveFolder();
   showingTrash = true;
   $("emptyTrashBtn").classList.remove("hidden");
   $("newNoteBtn").classList.add("hidden");
@@ -227,24 +325,25 @@ async function loadTrash(){
   let trash = [];
   try { trash = await invoke("list_trash"); }
   catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
+  if (epoch !== notesViewEpoch) return;
   const g = $("notesGrid"); g.innerHTML = "";
-  if(!trash.length) g.innerHTML = `<p class="muted">Corbeille vide ✨</p>`;
+  if(!trash.length) g.innerHTML = `<p class="muted">${esc(t("trash_empty"))}</p>`;
   for(const n of trash){
-    const pname = (profiles.find(p => p.id === n.profile_id)?.name) || "profil supprimé";
+    const pname = (profiles.find(p => p.id === n.profile_id)?.name) || t("folder_deleted_profile");
     const c = document.createElement("div");
     c.className = `note-card wp-${n.wallpaper||"aurora"} ${n.glass?"glassy":""}`;
-    const title = n.is_locked ? "🔒 Note verrouillée" : n.title;
-    c.innerHTML = `<h4>${title}</h4><p class="muted">👤 ${pname} • 🗑 ${new Date(n.trashed_at).toLocaleString()}</p>
-      <div class="trash-actions"><button class="btn small secondary" data-restore="${n.id}">${esc(t("restore_btn"))}</button><button class="btn small danger" data-purge="${n.id}">✕ Détruire</button></div>`;
+    const title = n.is_locked ? "🔒 " + t("commands_locked") : n.title;
+    c.innerHTML = `<h4>${esc(title)}</h4><p class="muted">👤 ${esc(pname)} • 🗑 ${new Date(n.trashed_at).toLocaleString()}</p>
+      <div class="trash-actions"><button class="btn small secondary" data-restore="${esc(n.id)}">${esc(t("restore_btn"))}</button><button class="btn small danger" data-purge="${esc(n.id)}">✕ ${esc(t("destroy_btn"))}</button></div>`;
     g.appendChild(c);
   }
   g.onclick = async (e) => {
     const r = e.target.dataset?.restore, p = e.target.dataset?.purge;
     if (r) {
       try { await invoke("restore_note", { id: r }); } catch(err) { if (!await sessionError(err)) await sysAlert("❌ " + err); return; }
-      await refreshTrashCount(); loadTrash(); loadNotesSilent();
+      await loadProfiles(); await refreshTrashCount(); loadTrash(); loadNotesSilent();
     } else if (p) {
-      const c = await sysConfirm("Destruction DÉFINITIVE de cette note ? Irréversible.", "⚠️ Détruire ?", "Détruire");
+      const c = await sysConfirm(t("destroy_confirm"), t("destroy_title"), t("destroy_btn"));
       if (!c.ok) return;
       try { await invoke("purge_note", { id: p }); } catch(err) { if (!await sessionError(err)) await sysAlert("❌ " + err); return; }
       await refreshTrashCount(); loadTrash();
@@ -260,31 +359,207 @@ async function loadNotesSilent(){
 async function refreshTrashCount(){
   try { $("trashCount").textContent = (await invoke("list_trash")).length; }
   catch(e) {}
+  organizationCenter?.refreshFolders();
 }
 $("emptyTrashBtn").onclick = async () => {
-  const c = await sysConfirm("Vider entièrement la corbeille ? Destruction DÉFINITIVE et irréversible.", "⚠️ Vider la corbeille", "Vider");
+  const c = await sysConfirm(t("empty_trash_confirm"), t("empty_trash_title"), t("empty_btn"));
   if (!c.ok) return;
   try {
     const n = await invoke("empty_trash");
-    await sysAlert(`${n} note(s) détruite(s) définitivement.`, "🗑 Corbeille vidée");
+    await sysAlert(tr("notes_destroyed", { count: n }), t("trash_emptied"));
   } catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
   await refreshTrashCount(); loadTrash();
 };
-$("newNoteBtn").onclick = async () => { if(!currentProfile) return sysAlert(t("create_profile_first"), t("profile_required")); editingId=null; pendingTags=[]; $("tagInput").value=""; renderTagPills(); $("modalTitle").textContent=t("modal_new"); $("noteTitle").value=""; $("noteContent").value=""; $("noteModal").classList.remove("hidden"); };
-$("cancelNoteBtn").onclick = () => $("noteModal").classList.add("hidden");
+let fileReadToken = 0, readingFile = false, savingNote = false;
+let editorSession = null, editorEpoch = 0, editorChange = 0, editorSaved = 0;
+let editorPromise = null, autosaveTimer = null, openingEditor = false;
+function resetNoteForm({ release = true } = {}) {
+  if (editorSession && release) invoke("close_note_editor", { token: editorSession.token }).catch(() => {});
+  editorSession = null;
+  editorEpoch++;
+  editorChange = editorSaved = 0;
+  editorPromise = null;
+  clearTimeout(autosaveTimer);
+  fileReadToken++;
+  readingFile = false;
+  editingId = null;
+  pendingFile = null;
+  pendingTags = [];
+  for (const id of ["noteTitle", "noteContent", "notePass", "noteFile", "tagInput"]) $(id).value = "";
+  $("notePass").disabled = true;
+  $("noteProtection").value = "keep";
+  $("noteWallpaper").value = "aurora";
+  $("noteGlass").checked = true;
+  $("removeAttachment").checked = false;
+  $("fileHint").textContent = "";
+  $("saveNoteBtn").disabled = savingNote;
+  $("saveStatus").textContent = t("save_ready");
+  $("cancelNoteBtn").textContent = t("editor_close");
+  renderTagPills();
+}
+$("newNoteBtn").onclick = async () => {
+  if (savingNote) return;
+  if (!currentProfile) return sysAlert(t("create_profile_first"), t("profile_required"));
+  await openEditor({ profile_id: currentProfile.id });
+};
+$("cancelNoteBtn").onclick = () => finishEditor(false);
+
+async function openEditor(params) {
+  if (openingEditor || savingNote) return;
+  openingEditor = true;
+  if (editorSession) {
+    await finishEditor(false);
+    if (editorSession) { openingEditor = false; return; }
+  }
+  resetNoteForm();
+  const epoch = editorEpoch;
+  try {
+    const session = await invoke("open_note_editor", { params });
+    if (epoch !== editorEpoch) {
+      await invoke("close_note_editor", { token: session.token });
+      return;
+    }
+    editorSession = session;
+    editingId = session.note_id;
+    const content = session.content;
+    $("noteTitle").value = content.title;
+    $("noteContent").value = content.content;
+    $("noteWallpaper").value = content.wallpaper;
+    $("noteGlass").checked = content.glass;
+    pendingTags = [...content.tags];
+    renderTagPills();
+    $("fileHint").textContent = content.attachment_name ? "📎 " + content.attachment_name : "";
+    $("modalTitle").textContent = session.note_id ? t("edit_title") : t("modal_new");
+    $("cancelNoteBtn").textContent = t(session.protected ? "editor_close_locked" : "editor_close");
+    clearReading();
+    $("draftsModal").classList.add("hidden");
+    $("noteModal").classList.remove("hidden");
+    // Un brouillon récupéré doit pouvoir être publié même sans nouvelle frappe.
+    if (params.draft_id) { editorChange = 1; $("saveStatus").textContent = t("save_draft_ok"); }
+  } catch (e) { if (!await sessionError(e)) await sysAlert("❌ " + e); }
+  finally { openingEditor = false; }
+}
+
+function validEditorPassword() {
+  return $("noteProtection").value !== "set" || [...$("notePass").value].length >= 4;
+}
+
+function markNoteDirty() {
+  if (!editorSession) return;
+  editorChange++;
+  $("saveStatus").textContent = t("save_dirty");
+  clearTimeout(autosaveTimer);
+  autosaveTimer = setTimeout(() => flushEditor(false), 1200);
+}
+
+function editorSnapshot(commit) {
+  const base = editorSession.content;
+  const attachment = $("removeAttachment").checked ? null : pendingFile || (base.attachment_name ? { name: base.attachment_name, data: base.attachment_data } : null);
+  return {
+    token: editorSession.token,
+    content: { title: $("noteTitle").value, content: $("noteContent").value,
+      wallpaper: $("noteWallpaper").value, glass: $("noteGlass").checked, tags: [...pendingTags],
+      attachment_name: attachment?.name ?? null, attachment_data: attachment?.data ?? null },
+    new_password: $("noteProtection").value === "set" ? $("notePass").value : null,
+    remove_protection: $("noteProtection").value === "remove",
+    commit,
+  };
+}
+
+async function flushEditor(publish = false) {
+  const epoch = editorEpoch;
+  while (editorPromise) {
+    const pending = editorPromise;
+    await pending;
+    if (editorPromise === pending) editorPromise = null;
+    if (epoch !== editorEpoch) return false;
+  }
+  if (!editorSession || epoch !== editorEpoch) return false;
+  if (readingFile) { $("saveStatus").textContent = t("save_file_busy"); return false; }
+  if (!validEditorPassword()) { $("saveStatus").textContent = t("save_password_short"); return false; }
+  if (editorChange === editorSaved && !(publish && !editorSession.note_id)) return true;
+  const sequence = editorChange;
+  const snapshot = editorSnapshot(publish || !!editorSession.note_id);
+  $("saveStatus").textContent = t("save_busy");
+  const task = (async () => {
+    try {
+      const result = await invoke("save_note_editor", { params: snapshot });
+      if (epoch !== editorEpoch || !editorSession) return false;
+      editorSession.note_id = result.note_id;
+      editorSession.protected = result.protected;
+      editorSession.content = snapshot.content;
+      editingId = result.note_id;
+      editorSaved = sequence;
+      const requestedMode = snapshot.remove_protection ? "remove" : snapshot.new_password !== null ? "set" : "keep";
+      if ($("noteProtection").value === requestedMode && (requestedMode !== "set" || $("notePass").value === snapshot.new_password)) {
+        $("noteProtection").value = "keep";
+        $("notePass").value = "";
+        $("notePass").disabled = true;
+      }
+      $("cancelNoteBtn").textContent = t(result.protected ? "editor_close_locked" : "editor_close");
+      $("saveStatus").textContent = t(editorChange > editorSaved ? "save_dirty" : result.committed ? "save_ok" : "save_draft_ok");
+      refreshDraftCount();
+      return true;
+    } catch (e) {
+      if (epoch !== editorEpoch) return false;
+      if (!await sessionError(e)) $("saveStatus").textContent = t("save_error") + " " + String(e);
+      return false;
+    }
+  })();
+  editorPromise = task;
+  const success = await task;
+  if (editorPromise === task) editorPromise = null;
+  if (epoch === editorEpoch && editorChange > sequence) {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(() => flushEditor(false), 1200);
+  }
+  return success;
+}
+
+async function finishEditor(publish) {
+  if (savingNote || readingFile || !editorSession) return;
+  savingNote = true;
+  $("saveNoteBtn").disabled = true;
+  clearTimeout(autosaveTimer);
+  const epoch = editorEpoch;
+  try {
+    do {
+      if (!await flushEditor(publish)) return;
+    } while (epoch === editorEpoch && editorChange > editorSaved);
+    if (epoch !== editorEpoch || !editorSession) return;
+    await invoke("close_note_editor", { token: editorSession.token });
+    currentProfile = profiles.find(p => p.id === editorSession.profile_id) || currentProfile;
+    editorSession = null;
+    $("noteModal").classList.add("hidden");
+    resetNoteForm();
+    await loadProfiles();
+    await refreshCurrentNotesView();
+    refreshDraftCount();
+    return true;
+  } catch (e) { if (!await sessionError(e)) $("saveStatus").textContent = t("save_error") + " " + String(e); }
+  finally { savingNote = false; $("saveNoteBtn").disabled = readingFile; }
+}
+
+for (const id of ["noteTitle", "noteContent", "notePass"]) $(id).oninput = markNoteDirty;
+for (const id of ["noteWallpaper", "noteGlass", "removeAttachment"]) $(id).onchange = markNoteDirty;
+$("noteProtection").onchange = () => {
+  $("notePass").disabled = $("noteProtection").value !== "set";
+  if ($("notePass").disabled) $("notePass").value = "";
+  markNoteDirty();
+};
 // --- Tags ---
 function renderTagPills(){
-  $("tagPills").innerHTML = pendingTags.map((t, i) => `<span class="tag-pill">#${esc(t)} <button data-untag="${i}" title="Retirer">×</button></span>`).join("");
+  $("tagPills").innerHTML = pendingTags.map((tag, i) => `<span class="tag-pill">#${esc(tag)} <button data-untag="${i}" title="${esc(t("remove_btn"))}">×</button></span>`).join("");
 }
 $("tagPills").onclick = (e) => {
   const i = e.target.dataset?.untag;
-  if (i !== undefined) { pendingTags.splice(Number(i), 1); renderTagPills(); }
+  if (i !== undefined) { pendingTags.splice(Number(i), 1); renderTagPills(); markNoteDirty(); }
 };
 $("tagInput").onkeydown = (e) => {
   if (e.key !== "Enter") return;
   e.preventDefault();
   const v = e.target.value.trim().toLowerCase().slice(0, 24);
-  if (v && !pendingTags.includes(v) && pendingTags.length < 12) { pendingTags.push(v); renderTagPills(); }
+  if (v && !pendingTags.includes(v) && pendingTags.length < 12) { pendingTags.push(v); renderTagPills(); markNoteDirty(); }
   e.target.value = "";
 };
 // --- Barre d'insertion rapide : [[ ]], @, 📍, 💡, 📅, #lieu/, #idée/ ---
@@ -297,6 +572,7 @@ function insertIntoNote(before, after = "") {
   const pos = s + before.length + sel.length + (sel ? 0 : 0);
   // Si rien de sélectionné et insertion paire ([[ ]]) : curseur au milieu
   ta.selectionStart = ta.selectionEnd = after && !sel ? s + before.length : pos + (sel ? after.length : 0);
+  markNoteDirty();
 }
 document.querySelectorAll("[data-insert]").forEach(b => {
   b.onclick = () => {
@@ -331,43 +607,82 @@ async function refreshTagBar(){
 }
 
 function searchParams(){
-  const parse = (v) => v ? new Date(v + "T00:00:00Z").toISOString() : null;
-  return { query: $("q").value || null, profile_id: currentProfile?.id || null, date_from: parse($("dfrom").value), date_to: parse($("dto").value), tag: selectedTag || null };
+  const parse = (v, end = false) => {
+    if (!v) return null;
+    const date = new Date(v + "T00:00:00Z");
+    if (end) date.setUTCDate(date.getUTCDate() + 1);
+    return date.toISOString();
+  };
+  return { query: $("q").value || null, profile_id: currentProfile?.id || null, date_from: parse($("dfrom").value), date_to: parse($("dto").value, true), tag: selectedTag || null };
 }
 
 async function applyTagSearch(){
+  const epoch = ++notesViewEpoch;
   refreshTagBar();
   exitTrashMode();
   let res = [];
   try { res = await invoke("search_notes", { params: searchParams() }); }
   catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
+  if (epoch !== notesViewEpoch) return;
+  organizationCenter?.leaveFolder();
+  currentNotes = res;
   renderNotes(res);
-  $("currentProfileTitle").textContent = selectedTag ? `🏷 #${selectedTag} — ${res.length} résultat(s)` : `🔍 ${res.length} résultat(s)`;
+  $("currentProfileTitle").textContent = (selectedTag ? `🏷 #${selectedTag} — ` : "🔍 ") + tr("commands_count", { count: res.length });
 }
 $("noteFile").onchange = (e) => {
-  const f = e.target.files[0]; if(!f) return pendingFile=null;
+  const token = ++fileReadToken;
+  const f = e.target.files[0];
+  pendingFile = null;
+  readingFile = !!f;
+  $("saveNoteBtn").disabled = readingFile || savingNote;
+  if (!f) { $("fileHint").textContent = ""; markNoteDirty(); return; }
+  $("saveStatus").textContent = t("save_file_busy");
+  $("removeAttachment").checked = false;
   const r = new FileReader();
-  r.onload = () => { pendingFile = { name: f.name, data: r.result.split(",")[1] }; $("fileHint").textContent = "📎 " + f.name; };
+  r.onload = () => {
+    if (token !== fileReadToken) return;
+    readingFile = false;
+    pendingFile = { name: f.name, data: r.result.split(",")[1] };
+    $("fileHint").textContent = "📎 " + f.name;
+    $("saveNoteBtn").disabled = savingNote;
+    markNoteDirty();
+  };
+  r.onerror = () => {
+    if (token !== fileReadToken) return;
+    readingFile = false;
+    $("saveNoteBtn").disabled = savingNote;
+    markNoteDirty();
+    sysAlert(t("attachment_read_error"));
+  };
   r.readAsDataURL(f);
 };
-$("saveNoteBtn").onclick = async () => {
-  const title = $("noteTitle").value, content = $("noteContent").value;
-  const wallpaper = $("noteWallpaper").value, glass = $("noteGlass").checked;
-  const notePassword = $("notePass").value || null;
-  try {
-    if(editingId){
-      await invoke("update_note", { id: editingId, title, content, wallpaper, glass, tags: pendingTags });
-    } else {
-      await invoke("create_note", { profileId: currentProfile.id, title, content, notePassword,
-        attachmentName: pendingFile?.name||null, attachmentData: pendingFile?.data||null, wallpaper, glass, tags: pendingTags });
-    }
-    $("noteModal").classList.add("hidden"); pendingFile=null; $("notePass").value=""; loadNotes();
-  } catch(e){ if (!await sessionError(e)) await sysAlert("❌ " + e); }
-};
+$("saveNoteBtn").onclick = () => finishEditor(true);
 
 // --- Surlignage : rendu + sélection ---
 let viewingPlaintext = "";
-const esc = (s) => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+const esc = (s) => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+
+function notePreview(text) {
+  return text.replace(/\[\[([^\]]{1,200})\]\]/g, (raw, inner) => {
+    const separator = inner.indexOf("|");
+    return separator < 0 ? raw : `[[${inner.slice(separator + 1).trim() || inner.slice(0, separator).trim()}]]`;
+  });
+}
+
+function renderLinkedText(text, sourceOffset = 0) {
+  let html = "", pos = 0;
+  for (const match of text.matchAll(/\[\[([^\]]{1,200})\]\]/g)) {
+    html += esc(text.slice(pos, match.index));
+    const raw = match[1].trim(), separator = raw.indexOf("|");
+    const ref = (separator < 0 ? raw : raw.slice(0, separator)).trim();
+    const label = (separator < 0 ? raw : raw.slice(separator + 1)).trim() || ref;
+    const start = sourceOffset + [...text.slice(0, match.index)].length;
+    const end = start + [...match[0]].length;
+    html += ref && [...ref].length <= 80 ? `<span class="wikilink" data-ref="${esc(ref)}" data-source-start="${start}" data-source-end="${end}" title="${esc(tr("open_named", { name: label }))}">[[${esc(label)}]]</span>` : esc(match[0]);
+    pos = match.index + match[0].length;
+  }
+  return html + esc(text.slice(pos));
+}
 
 function renderHighlighted(text, highlights) {
   const chars = [...text];
@@ -376,17 +691,13 @@ function renderHighlighted(text, highlights) {
   for (const h of valid) {
     if (h.start < pos) continue; // chevauchement : on ignore
     const end = Math.min(h.end, chars.length);
-    html += esc(chars.slice(pos, h.start).join(""));
-    html += `<mark class="hl hl-${h.color}" data-hl="${h.id}" title="Cliqué pour retirer ce surlignage">` + esc(chars.slice(h.start, end).join("")) + `</mark>`;
+    html += renderLinkedText(chars.slice(pos, h.start).join(""), pos);
+    const color = ["yellow", "green", "pink", "blue", "orange"].includes(h.color) ? h.color : "yellow";
+    html += `<mark class="hl hl-${color}" data-hl="${esc(h.id)}" title="${esc(t("highlight_remove_hint"))}">` + renderLinkedText(chars.slice(h.start, end).join(""), h.start) + `</mark>`;
     pos = end;
   }
-  html += esc(chars.slice(pos).join(""));
-  // Liens [[Titre]] cliquables (les crochets ne peuvent pas apparaître dans les attributs générés)
-  html = html.replace(/\[\[([^\]]{1,80})\]\]/g, (m, ref) => {
-    const r = ref.trim();
-    return r ? `<span class="wikilink" data-ref="${esc(r)}" title="Ouvrir « ${esc(r)} »">⟦${esc(r)}⟧</span>` : m;
-  });
-  return html || `<span class="muted">— vide —</span>`;
+  html += renderLinkedText(chars.slice(pos).join(""), pos);
+  return html || `<span class="muted">${esc(t("content_empty"))}</span>`;
 }
 
 function syncViewingNote(updated) {
@@ -395,41 +706,57 @@ function syncViewingNote(updated) {
   if (i >= 0) currentNotes[i] = updated;
   // Re-rend les vignettes pour que leur closure n'ouvre plus l'ancienne version sans surlignages
   renderNotes(currentNotes);
+  organizationCenter?.loadReader(updated);
+  organizationCenter?.refreshFolders();
 }
 
-// Offsets de la sélection en caractères (marche même avec des <mark> imbriqués)
+// Les libellés des liens stables peuvent être plus courts que leur syntaxe source.
 function getSelectionOffsets(container) {
   const sel = window.getSelection();
   if (!sel.rangeCount || sel.isCollapsed) return null;
   const range = sel.getRangeAt(0);
-  const pre = range.cloneRange();
-  pre.selectNodeContents(container);
-  pre.setEnd(range.startContainer, range.startOffset);
-  const start = [...pre.toString()].length;
-  const end = start + [...range.toString()].length;
-  return { start, end };
+  if (!container.contains(range.startContainer) || !container.contains(range.endContainer)) return null;
+  const isLink = node => node.nodeType === 1 && node.dataset?.sourceStart !== undefined;
+  const length = node => isLink(node) ? Number(node.dataset.sourceEnd) - Number(node.dataset.sourceStart)
+    : node.nodeType === 3 ? [...node.textContent].length : [...node.childNodes].reduce((n, child) => n + length(child), 0);
+  function boundary(node, target, offset, end, base = 0) {
+    if (isLink(node) && (node === target || node.contains(target))) {
+      const atStart = offset === 0, atEnd = node === target ? offset === node.childNodes.length : offset === target.textContent.length;
+      return Number(atStart ? node.dataset.sourceStart : atEnd || end ? node.dataset.sourceEnd : node.dataset.sourceStart);
+    }
+    if (node === target) return base + (node.nodeType === 3 ? [...node.textContent.slice(0, offset)].length : [...node.childNodes].slice(0, offset).reduce((n, child) => n + length(child), 0));
+    for (const child of node.childNodes || []) {
+      const found = boundary(child, target, offset, end, base);
+      if (found !== null) return found;
+      base += length(child);
+    }
+    return null;
+  }
+  const start = boundary(container, range.startContainer, range.startOffset, false);
+  const end = boundary(container, range.endContainer, range.endOffset, true);
+  return start !== null && end !== null && start < end ? { start, end } : null;
 }
 
 function paintMeta(n){
-  $("vMeta").innerHTML = `📅 Créée le ${new Date(n.created_at).toLocaleString()}`
+  $("vMeta").innerHTML = `📅 ${esc(tr("note_created_on", { date: new Date(n.created_at).toLocaleString() }))}`
     + (n.modified_history.length
-      ? `<br>✏️ ${n.modified_history.length} modification(s) :<br>` + n.modified_history.map(d=>`• ${new Date(d).toLocaleString()}`).join("<br>")
-      : `<br>✏️ Aucune modification`);
+      ? `<br>✏️ ${esc(tr("modifications_count", { count: n.modified_history.length }))} :<br>` + n.modified_history.map(d=>`• ${new Date(d).toLocaleString()}`).join("<br>")
+      : `<br>✏️ ${esc(t("modifications_none"))}`);
 }
 
 function renderVersions(){
   const box = $("vVersions"); box.innerHTML = "";
   const vers = viewingNote?.versions || [];
   $("vVerSum").textContent = `${t("versions_prev")} (${vers.length})`;
-  if (!vers.length) { box.innerHTML = `<span class="muted">Aucune version — elles apparaissent ici à chaque modification.</span>`; return; }
+  if (!vers.length) { box.innerHTML = `<span class="muted">${esc(t("versions_empty"))}</span>`; return; }
   [...vers].map((v, i) => ({ v, i })).reverse().forEach(({ v, i }) => {
     const d = document.createElement("div");
     d.className = "ver-item";
-    d.innerHTML = `<span>🕓 ${new Date(v.saved_at).toLocaleString()} — ${(v.content||"").slice(0,60)}${(v.content||"").length>60?"…":""}</span>`;
+    d.innerHTML = `<span>🕓 ${new Date(v.saved_at).toLocaleString()} — ${esc((v.content||"").slice(0,60))}${(v.content||"").length>60?"…":""}</span>`;
     const b = document.createElement("button");
     b.className = "btn small secondary"; b.textContent = t("restore_btn");
     b.onclick = async () => {
-      const c = await sysConfirm(`Restaurer le contenu du ${new Date(v.saved_at).toLocaleString()} ? Le contenu actuel sera conservé comme version.`, "📜 Restaurer une version");
+      const c = await sysConfirm(tr("version_restore_confirm", { date: new Date(v.saved_at).toLocaleString() }), t("version_restore_title"));
       if (!c.ok) return;
       try {
         const updated = await invoke("restore_version", { id: viewingNote.id, index: i });
@@ -439,6 +766,7 @@ function renderVersions(){
         paintMeta(updated);
         $("vContent").innerHTML = renderHighlighted(viewingPlaintext, updated.highlights);
         renderVersions();
+        if (organizationCenter?.activeFolderId()) await refreshCurrentNotesView();
       } catch(err) { if (!await sessionError(err)) await sysAlert("❌ " + err); }
     };
     d.appendChild(b);
@@ -447,30 +775,62 @@ function renderVersions(){
 }
 
 async function viewNote(n){
+  clearReading();
   viewingNote = n;
   viewingPlaintext = "";
   // Titre masqué tant que la note verrouillée n'est pas déchiffrée
-  $("vTitle").textContent = n.is_locked ? "🔒 Note verrouillée" : n.title;
+  $("vTitle").textContent = n.is_locked ? "🔒 " + t("commands_locked") : n.title;
+  $("relockViewBtn").classList.toggle("hidden", !n.is_locked);
   paintMeta(n);
   $("viewCard").className = `modal-card wp-${n.wallpaper||"aurora"} ${n.glass ? "glassy" : "solid"}`;
   renderVersions();
   if(n.is_locked){
-    const r = await sysPrompt("Mot de passe individuel de cette note :", "🔒 Note verrouillée", true);
+    const r = await sysPrompt(t("note_auth"), "🔒 " + t("commands_locked"), true);
     if(!r.ok) return;
     try {
-      const txt = await invoke("unlock_note_content", { id: n.id, password: r.value });
-      viewingPlaintext = txt;
-      $("vTitle").textContent = "🔒 " + n.title;
-      $("vContent").innerHTML = esc(txt);
+      const payload = await invoke("unlock_note_content", { id: n.id, password: r.value });
+      if (viewingNote !== n) return;
+      viewingPlaintext = payload.content;
+      $("vTitle").textContent = "🔒 " + payload.title;
+      $("vContent").innerHTML = renderHighlighted(payload.content, payload.highlights);
+      renderAttachment(payload);
     }
     catch(e){ if (!await sessionError(e)) $("vContent").textContent = "❌ " + e; }
   } else {
     viewingPlaintext = n.content || "";
     $("vContent").innerHTML = renderHighlighted(viewingPlaintext, n.highlights);
+    renderAttachment(n);
   }
-  $("vAttach").innerHTML = (!n.is_locked && n.attachment_name) ? `📎 Pièce jointe : <b>${n.attachment_name}</b>` : (n.is_locked ? `📎 <span class="muted">pièce jointe masquée</span>` : "");
   renderViewTags();
   $("viewModal").classList.remove("hidden");
+  organizationCenter?.loadReader(n);
+}
+
+function renderAttachment(note) {
+  $("vAttach").innerHTML = "";
+  if (!note.attachment_name || !note.attachment_data) return;
+  const button = document.createElement("button");
+  button.className = "btn small secondary";
+  button.textContent = tr("download_attachment", { name: note.attachment_name });
+  button.onclick = () => {
+    const bytes = Uint8Array.from(atob(note.attachment_data), ch => ch.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = note.attachment_name.split(/[/\\]/).pop();
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  $("vAttach").appendChild(button);
+}
+
+function clearReading() {
+  organizationCenter?.clearReader();
+  viewingNote = null;
+  viewingPlaintext = "";
+  $("viewModal").classList.add("hidden");
+  $("focusModal").classList.add("hidden");
+  for (const id of ["vTitle", "vContent", "vAttach", "vVersions", "vTags", "fTitle", "focusContent"]) $(id).innerHTML = "";
 }
 
 function renderViewTags(){
@@ -489,9 +849,9 @@ $("vTags").onclick = (e) => {
 document.querySelectorAll(".hl-dot").forEach(btn => {
   btn.onclick = async () => {
     try {
-      if (viewingNote?.is_locked) return sysAlert("Note verrouillée : surlignage impossible.", "🖍 Surlignage");
+      if (viewingNote?.is_locked) return sysAlert(t("highlight_locked"), t("highlight_title"));
       const off = getSelectionOffsets($("vContent"));
-      if (!off) return sysAlert("Sélectionnez d'abord un mot ou une phrase dans la note.", "🖍 Surlignage");
+      if (!off) return sysAlert(t("highlight_select"), t("highlight_title"));
       const updated = await invoke("add_highlight", { id: viewingNote.id, start: off.start, end: off.end, color: btn.dataset.color });
       syncViewingNote(updated);
       viewingPlaintext = updated.content || viewingPlaintext;
@@ -503,14 +863,7 @@ document.querySelectorAll(".hl-dot").forEach(btn => {
 
 // Clic sur un lien [[...]] = ouvrir la note cible
 async function openWikilink(ref){
-  let all = [];
-  try { all = await invoke("search_notes", { params: { query: null, profile_id: null, date_from: null, date_to: null, tag: null } }); }
-  catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
-  const key = ref.toLowerCase();
-  const t = all.find(n => !n.is_locked && n.title.toLowerCase() === key)
-        || all.find(n => !n.is_locked && n.id === ref);
-  if (!t) return sysAlert(`Aucune note nommée « ${ref} ».`, "🔗 Lien");
-  viewNote(t);
+  await organizationCenter.openReference(ref);
 }
 
 // Clic sur un surlignage existant = le supprimer
@@ -519,7 +872,8 @@ $("vContent").onclick = async (e) => {
   if (w) { openWikilink(w.dataset.ref); return; }
   const m = e.target.closest?.("mark.hl");
   if (!m) return;
-  const c = await sysConfirm("Retirer ce surlignage ?", "🧽 Surlignage", "Retirer");
+  if (viewingNote?.is_locked) return;
+  const c = await sysConfirm(t("highlight_remove_confirm"), t("highlight_title"), t("remove_btn"));
   if (!c.ok) return;
   try {
     const updated = await invoke("remove_highlight", { id: viewingNote.id, highlightId: m.dataset.hl });
@@ -528,7 +882,8 @@ $("vContent").onclick = async (e) => {
     $("vContent").innerHTML = renderHighlighted(viewingPlaintext, updated.highlights);
   } catch(err){ if (!await sessionError(err)) await sysAlert("❌ " + err); }
 };
-$("closeViewBtn").onclick = () => $("viewModal").classList.add("hidden");
+$("closeViewBtn").onclick = clearReading;
+$("relockViewBtn").onclick = clearReading;
 
 // Lecture agrandie : même fond + mêmes marquages, texte seul
 $("expandBtn").onclick = () => {
@@ -538,9 +893,11 @@ $("expandBtn").onclick = () => {
   $("focusModal").classList.remove("hidden");
 };
 $("closeFocusBtn").onclick = () => $("focusModal").classList.add("hidden");
-addEventListener("keydown", (e) => { if (e.key === "Escape") { $("focusModal").classList.add("hidden"); $("dashModal").classList.add("hidden"); $("graphModal").classList.add("hidden"); $("backupModal").classList.add("hidden"); } });
+$("focusContent").onclick = e => { const link = e.target.closest?.(".wikilink"); if (link) openWikilink(link.dataset.ref); };
+addEventListener("keydown", (e) => { if (e.key === "Escape" && !commandCenter?.isOpen() && !organizationCenter?.isOpen() && !transferCenter?.isOpen()) { $("focusModal").classList.add("hidden"); $("dashModal").classList.add("hidden"); $("graphModal").classList.add("hidden"); $("backupModal").classList.add("hidden"); $("draftsModal").classList.add("hidden"); } });
 // Leurre : Ctrl+L / Cmd+L affiche/masque le carré leurre (dashboard principal = leurre sinon)
 addEventListener("keydown", (e) => {
+  if (commandCenter?.isOpen()) return;
   if ((e.ctrlKey || e.metaKey) && (e.key === "l" || e.key === "L")) {
     e.preventDefault();
     decoyVisible = !decoyVisible;
@@ -549,21 +906,24 @@ addEventListener("keydown", (e) => {
   }
 });
 $("delViewBtn").onclick = async () => {
-  const c = await sysConfirm("Placer cette note dans la corbeille ? Vous pourrez la restaurer.", "🗑 Corbeille", "Mettre à la corbeille");
+  const c = await sysConfirm(t("note_trash_confirm"), t("trash_btn"), t("note_trash_btn"));
   if (!c.ok) return;
   try { await invoke("delete_note", { id: viewingNote.id }); }
   catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
   $("viewModal").classList.add("hidden");
   await refreshTrashCount();
-  if (showingTrash) loadTrash(); else loadNotes();
+  if (showingTrash) loadTrash(); else refreshCurrentNotesView();
 };
 $("editViewBtn").onclick = async () => {
-  if(viewingNote.is_locked) return sysAlert("Note verrouillée : modification impossible sans recréation.", "✏️ Modification");
-  $("viewModal").classList.add("hidden"); editingId = viewingNote.id;
-  pendingTags = [...(viewingNote.tags || [])]; $("tagInput").value = ""; renderTagPills();
-  $("modalTitle").textContent = t("edit_title"); $("noteTitle").value = viewingNote.title; $("noteContent").value = viewingNote.content;
-  $("noteWallpaper").value = viewingNote.wallpaper||"aurora"; $("noteGlass").checked = viewingNote.glass;
-  $("noteModal").classList.remove("hidden");
+  if (!viewingNote) return;
+  const note = viewingNote;
+  let password = null;
+  if (note.is_locked) {
+    const answer = await sysPrompt(t("edit_auth"), "🔒", true);
+    if (!answer.ok || viewingNote !== note) return;
+    password = answer.value;
+  }
+  await openEditor({ note_id: note.id, password });
 };
 
 // --- Graphe multi-couches : notes [[...]] + tags + @mentions ---
@@ -633,7 +993,7 @@ function applyGraphMode(mode){
   const npl = nodes.filter(n => n.kind === "place").length;
   const ni = nodes.filter(n => n.kind === "idea").length;
   const nd = nodes.filter(n => n.kind === "date").length;
-  $("graphInfo").textContent = `${nn} note(s) • ${nt} tag(s) • ${np} @(s) • ${npl} 📍 • ${ni} 💡 • ${nd} 📅 • ${edges.length} lien(s)`;
+  $("graphInfo").textContent = tr("graph_counts", { notes: nn, tags: nt, persons: np, places: npl, ideas: ni, dates: nd, links: edges.length });
   layoutGraph({ nodes, edges });
 }
 document.querySelectorAll("[data-graph-mode]").forEach(b => {
@@ -784,16 +1144,16 @@ addEventListener("mousemove", (e) => {
     tip.classList.remove("hidden");
     const kind = n.kind || "note";
     tip.textContent = kind === "note"
-      ? `${n.title} • 👤 ${n.profile} • ${n.links} lien(s)`
+      ? `${n.title} • 👤 ${n.profile} • ${tr("links_count", { count: n.links })}`
       : kind === "tag"
-        ? `${n.title} • 🏷 ${n.links} note(s) — cliquer pour filtrer`
+        ? `${n.title} • 🏷 ${tr("notes_count", { count: n.links })} — ${t("graph_filter_hint")}`
         : kind === "date"
-          ? `${n.title} • 📅 ${n.links} note(s) — cliquer pour filtrer ce jour`
+          ? `${n.title} • 📅 ${tr("notes_count", { count: n.links })} — ${t("graph_day_hint")}`
           : (kind === "person" || kind === "mention")
-            ? `${n.title} • 🧔 ${n.links} note(s) — cliquer pour chercher`
+            ? `${n.title} • 🧔 ${tr("notes_count", { count: n.links })} — ${t("graph_search_hint")}`
             : kind === "place"
-              ? `${n.title} • 📍 ${n.links} note(s) — cliquer pour chercher`
-              : `${n.title} • 💡 ${n.links} note(s) — cliquer pour chercher`;
+              ? `${n.title} • 📍 ${tr("notes_count", { count: n.links })} — ${t("graph_search_hint")}`
+              : `${n.title} • 💡 ${tr("notes_count", { count: n.links })} — ${t("graph_search_hint")}`;
     const r = cv.parentElement.getBoundingClientRect();
     tip.style.left = Math.min(e.clientX - r.left + 14, r.width - 270) + "px";
     tip.style.top = (e.clientY - r.top + 12) + "px";
@@ -806,6 +1166,7 @@ addEventListener("mouseup", async () => {
   if (gDrag && !gMoved) {
     const n = gDrag;
     const kind = n.kind || "note";
+    if (kind !== "note") { notesViewEpoch++; organizationCenter?.leaveFolder(); }
     if (kind === "tag") {
       // Clic sur #tag : ferme le graphe et filtre les notes
       const tagName = n.id.startsWith("tag:") ? n.id.slice(4) : n.title.replace(/^#/, "");
@@ -828,7 +1189,7 @@ addEventListener("mouseup", async () => {
         const qlow = q.toLowerCase();
         const filtered = res.filter(x => ((x.title || "") + " " + (x.content || "")).toLowerCase().includes(qlow));
         renderNotes(filtered.length ? filtered : res);
-        $("currentProfileTitle").textContent = `🧔 ${q} — ${filtered.length} résultat(s)`;
+        $("currentProfileTitle").textContent = `🧔 ${q} — ${tr("commands_count", { count: filtered.length })}`;
       } catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); }
       gDrag = null;
       return;
@@ -848,13 +1209,13 @@ addEventListener("mouseup", async () => {
         const qlow = raw.toLowerCase();
         const filtered = all.filter(x => ((x.title || "") + " " + (x.content || "")).toLowerCase().includes(qlow));
         renderNotes(filtered);
-        $("currentProfileTitle").textContent = `${isIdea ? "💡" : "📍"} ${raw} — ${filtered.length} résultat(s)`;
+        $("currentProfileTitle").textContent = `${isIdea ? "💡" : "📍"} ${raw} — ${tr("commands_count", { count: filtered.length })}`;
       } catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); }
       gDrag = null;
       return;
     }
     if (kind === "date") {
-      // Clic sur 📅 date : filtre journalier (dfrom=date, dto=lendemain car date_to est exclusif)
+      // La borne de fin exclusive est calculée dans searchParams.
       const day = n.id.startsWith("date:") ? n.id.slice(5) : null;
       $("graphModal").classList.add("hidden");
       if (day) {
@@ -862,14 +1223,12 @@ addEventListener("mouseup", async () => {
         selectedTag = null;
         $("q").value = "";
         $("dfrom").value = day;
-        const next = new Date(day + "T00:00:00Z");
-        next.setUTCDate(next.getUTCDate() + 1);
-        $("dto").value = next.toISOString().slice(0, 10);
+        $("dto").value = day;
         refreshTagBar();
         try {
           const res = await invoke("search_notes", { params: searchParams() });
           renderNotes(res);
-          $("currentProfileTitle").textContent = `📅 ${day} — ${res.length} résultat(s)`;
+          $("currentProfileTitle").textContent = `📅 ${day} — ${tr("commands_count", { count: res.length })}`;
         } catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); }
       }
       gDrag = null;
@@ -887,6 +1246,55 @@ addEventListener("mouseup", async () => {
 });
 $("closeGraphBtn").onclick = () => $("graphModal").classList.add("hidden");
 
+// --- Brouillons chiffrés ---
+let draftInfos = [];
+async function refreshDraftCount() {
+  try {
+    draftInfos = await invoke("list_note_drafts");
+    $("draftCount").textContent = draftInfos.length;
+    return true;
+  } catch (e) { await sessionError(e); return false; }
+}
+
+async function openDrafts() {
+  if (!await refreshDraftCount()) return;
+  const list = $("draftsList");
+  list.innerHTML = draftInfos.length ? draftInfos.map(draft => {
+    const profile = profiles.find(p => p.id === draft.profile_id)?.name || "—";
+    return `<div class="ver-item"><span>${esc(t(draft.protected ? "draft_protected" : "draft_free"))} • ${esc(profile)} • ${esc(new Date(draft.updated_at).toLocaleString())}</span>
+      <div class="row"><button class="btn small secondary" data-draft="${esc(draft.id)}" data-action="recover">${esc(t("draft_recover"))}</button>
+      <button class="btn small ghost" data-draft="${esc(draft.id)}" data-action="copy">${esc(t("draft_copy"))}</button>
+      <button class="btn small danger" data-draft="${esc(draft.id)}" data-action="discard">${esc(t("draft_discard"))}</button></div></div>`;
+  }).join("") : `<p class="muted">${esc(t("drafts_empty"))}</p>`;
+  $("draftsModal").classList.remove("hidden");
+}
+
+async function recoverDraft(id, asNew = false) {
+  const draft = draftInfos.find(d => d.id === id);
+  if (!draft) return;
+  let password = null;
+  if (draft.protected) {
+    const answer = await sysPrompt(t("draft_auth"), "🔒", true);
+    if (!answer.ok) return;
+    password = answer.value;
+  }
+  const profile_id = profiles.some(p => p.id === draft.profile_id) ? draft.profile_id : currentProfile?.id || profiles[0]?.id || null;
+  await openEditor({ draft_id: id, recover_as_new: asNew, profile_id, password });
+}
+
+$("draftsBtn").onclick = openDrafts;
+$("closeDraftsBtn").onclick = () => $("draftsModal").classList.add("hidden");
+$("draftsList").onclick = async e => {
+  const button = e.target.closest?.("[data-draft]");
+  if (!button) return;
+  const { draft: id, action } = button.dataset;
+  if (action !== "discard") { await recoverDraft(id, action === "copy"); return; }
+  const answer = await sysConfirm(t("draft_discard_confirm"));
+  if (!answer.ok) return;
+  try { await invoke("discard_note_draft", { id }); await openDrafts(); }
+  catch (error) { if (!await sessionError(error)) await sysAlert("❌ " + error); }
+};
+
 // --- Backups ---
 $("backupBtn").onclick = openBackups;
 async function openBackups(){
@@ -895,21 +1303,21 @@ async function openBackups(){
   catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
   $("backupList").innerHTML = list.length ? list.map(b =>
     `<div class="bak-row"><span>📦 <b>${esc(b.name)}</b><br><span class="muted">${b.modified ? new Date(b.modified).toLocaleString() : ""} • ${fmtKB(b.bytes)}</span></span><button class="btn small secondary" data-restore="${esc(b.name)}">${esc(t("restore_btn"))}</button></div>`
-  ).join("") : `<p class="muted">Aucune sauvegarde pour le moment.</p>`;
+  ).join("") : `<p class="muted">${esc(t("backups_empty"))}</p>`;
   $("backupModal").classList.remove("hidden");
 }
 $("closeBackupBtn").onclick = () => $("backupModal").classList.add("hidden");
 $("doBackupBtn").onclick = async () => {
   try {
     const n = await invoke("backup_now");
-    await sysAlert(`Sauvegarde ${n} créée.`, "📦 Sauvegarde");
+    await sysAlert(tr("backup_created", { name: n }), t("backup_single"));
   } catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
   openBackups();
 };
 $("backupList").onclick = async (e) => {
   const name = e.target.dataset?.restore;
   if (!name) return;
-  const c = await sysConfirm("Restaurer cette sauvegarde ? L'état Actuel sera d'abord copié en sécurité, puis l'app reviendra à l'écran des coffres.", "↩ Restaurer", "Restaurer");
+  const c = await sysConfirm(t("backup_restore_confirm"), t("restore_btn"), t("restore_action"));
   if (!c.ok) return;
   try { await invoke("restore_backup", { name }); }
   catch(e2) { if (!await sessionError(e2)) await sysAlert("❌ " + e2); return; }
@@ -926,7 +1334,7 @@ function hbars(el, rows) {
   const max = Math.max(1, ...rows.map(r => r.value));
   el.innerHTML = rows.length ? rows.map(r =>
     `<div class="bar-row"><span title="${esc(r.label)}">${esc(r.label)}</span><div class="bar-track"><div class="bar-fill" style="width:${Math.round(r.value / max * 100)}%;background:${r.color || "#22d3ee"}"></div></div><b>${r.value}</b></div>`
-  ).join("") : `<span class="muted">— aucune donnée —</span>`;
+  ).join("") : `<span class="muted">${esc(t("data_empty"))}</span>`;
 }
 
 function drawDonut(cv, locked, unlocked) {
@@ -998,16 +1406,16 @@ $("dashBtn").onclick = async () => {
   drawDonut($("dashDonut"), st.locked_count, st.unlocked_count);
   $("dashDonutLegend").textContent = `🔒 ${st.locked_count} ${t("dash_locked")} • 🔓 ${st.unlocked_count} ${t("dash_free")}`;
   drawActivity($("dashActivity"), st.last_30d);
-  hbars($("dashColors"), st.highlights_by_color.map(([c, v]) => ({ label: c, value: v, color: HL_PALETTE[c] || "#fff" })));
-  hbars($("dashWalls"), st.wallpapers.map(([w, v]) => ({ label: w, value: v, color: WALL_PALETTE[w] || "#22d3ee" })));
+  hbars($("dashColors"), st.highlights_by_color.map(([c, v]) => ({ label: t(`color_${c}`) || c, value: v, color: HL_PALETTE[c] || "#fff" })));
+  hbars($("dashWalls"), st.wallpapers.map(([w, v]) => ({ label: t(`wall_${w}`) || w, value: v, color: WALL_PALETTE[w] || "#22d3ee" })));
   const hmax = Math.max(1, ...st.heat_84d.map(d => d.count));
   $("dashHeat").innerHTML = st.heat_84d.map(d => {
     const bg = d.count ? `rgba(34,211,238,${(0.25 + 0.75 * d.count / hmax).toFixed(2)})` : "rgba(255,255,255,.08)";
-    return `<div class="cell" style="background:${bg}" title="${d.date} : ${d.count} activité(s)"></div>`;
+    return `<div class="cell" style="background:${bg}" title="${esc(d.date)} : ${esc(tr("activity_count", { count: d.count }))}"></div>`;
   }).join("");
   $("dashTop").innerHTML = st.longest.length ? st.longest.map(x =>
     `<div class="top-row"><span><b>${esc(x.title)}</b> <span class="muted">• ${esc(x.profile)}</span></span><span class="muted"></span><b>${x.words} ${esc(t("kpi_words"))}</b></div>`
-  ).join("") : `<span class="muted">Aucune note pour le moment.</span>`;
+  ).join("") : `<span class="muted">${esc(t("dashboard_empty"))}</span>`;
   const f = (d) => d ? new Date(d).toLocaleDateString() : "—";
   $("dashSec").innerHTML =
     `<div>🔐 ${t("dash_encryption")} : <b>AES-256-GCM</b></div><div>🧂 KDF : <b>Argon2id</b> (64 Mio, t=3, p=1)</div>` +
@@ -1018,17 +1426,10 @@ $("dashBtn").onclick = async () => {
     `<div>📦 ${t("dash_file")} : <b>${esc(st.vault_path.split(/[/\\\\]/).pop())}</b> (${fmtKB(st.vault_bytes)})</div>`;
   // Streak + objectif
   const goal = st.daily_goal_words || 0;
-  const isKab = (typeof LANG !== "undefined" && LANG === "kab");
-  const streakDays = isKab ? `${st.streak_current} n wass` : `${st.streak_current} j`;
-  const recordLine = isKab
-    ? `asekles n wass ${st.streak_best} • ${st.days_active} n wass(en) urmid(en)`
-    : `record ${st.streak_best} j • ${st.days_active} j actif(s)`;
-  const todayGoal = isKab
-    ? `Assa-a: ${st.words_today} / ${goal} awal(en)`
-    : `Aujourd'hui : ${st.words_today} / ${goal} mots`;
-  const todayNoGoal = isKab
-    ? `Assa-a: ${st.words_today} awal(en) - sbadu iswi ddaw-a.`
-    : `Aujourd'hui : ${st.words_today} mot(s) — définis un objectif ci-dessous.`;
+  const streakDays = tr("streak_days", { count: st.streak_current });
+  const recordLine = tr("streak_record", { best: st.streak_best, active: st.days_active });
+  const todayGoal = tr("streak_today", { words: st.words_today, goal });
+  const todayNoGoal = tr("streak_no_goal", { words: st.words_today });
   $("dashStreak").innerHTML =
     `<div class="streak-big">🔥 ${streakDays}</div>` +
     `<div class="muted">${recordLine}</div>` +
@@ -1059,7 +1460,7 @@ $("dashBtn").onclick = async () => {
     $("dashSec").appendChild(box);
     if (st.has_decoy) {
       $("rmDecoy").onclick = async () => {
-        const c = await sysConfirm("Supprimer le coffre leurre ?", "🪞 Leurre", "Supprimer");
+        const c = await sysConfirm(t("decoy_remove_confirm"), "🪞 " + t("decoy_title"), t("delete_btn"));
         if (!c.ok) return;
         try { await invoke("remove_decoy"); } catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
         $("dashBtn").onclick();
@@ -1068,7 +1469,7 @@ $("dashBtn").onclick = async () => {
       $("setDecoy").onclick = async () => {
         try { await invoke("set_decoy", { decoyPassword: $("decoyPass").value }); }
         catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
-        await sysAlert("Leurre activé. Teste-le : verrouille puis déverrouille avec le mot de passe leurre.", `🪞 ${t("decoy_title")}`);
+        await sysAlert(t("decoy_enabled"), `🪞 ${t("decoy_title")}`);
         $("dashBtn").onclick();
       };
     }
@@ -1086,12 +1487,168 @@ $("closeDashBtn").onclick = () => $("dashModal").classList.add("hidden");
 
 // recherche avancée
 $("searchBtn").onclick = async () => {
+  const epoch = ++notesViewEpoch;
   exitTrashMode();
   let res = [];
   try { res = await invoke("search_notes", { params: searchParams() }); }
   catch(e) { if (!await sessionError(e)) await sysAlert("❌ " + e); return; }
+  if (epoch !== notesViewEpoch) return;
+  organizationCenter?.leaveFolder();
+  currentNotes = res;
   // La recherche par mot-clé ignore les notes verrouillées (titre masqué, contenu chiffré).
   renderNotes(res);
-  $("currentProfileTitle").textContent = selectedTag ? `🏷 #${selectedTag} — ${res.length} résultat(s)` : `🔍 ${res.length} résultat(s)`;
+  $("currentProfileTitle").textContent = (selectedTag ? `🏷 #${selectedTag} — ` : "🔍 ") + tr("commands_count", { count: res.length });
 };
 $("clearSearchBtn").onclick = () => { $("q").value=""; $("dfrom").value=""; $("dto").value=""; selectedTag=null; refreshTagBar(); loadNotes(); };
+
+async function prepareCommandNavigation() {
+  if (!$("sysModal").classList.contains("hidden")) return false;
+  if (organizationCenter?.isSaving()) return false;
+  if (transferCenter?.isBusy()) return false;
+  if (commandCenter?.hasCapture() && !await commandCenter.finishCapture(false)) return false;
+  if (editorSession && !await finishEditor(false)) return false;
+  if ($("mainView").classList.contains("hidden")) return false;
+  clearReading();
+  organizationCenter?.closeDialogs();
+  if (transferCenter?.isOpen()) transferCenter.close();
+  for (const id of ["dashModal", "graphModal", "backupModal", "draftsModal"]) $(id).classList.add("hidden");
+  return true;
+}
+
+function clearQueryFilters() {
+  $("q").value = $("dfrom").value = $("dto").value = "";
+  selectedTag = null;
+}
+
+commandCenter = window.SecureNotesCommands.create({
+  t: key => t(key),
+  invoke: (cmd, args) => invoke(cmd, args),
+  state: () => ({ unlocked: !$("mainView").classList.contains("hidden"), profiles, currentProfileId: currentProfile?.id }),
+  activity: recordActivity,
+  requestUnlock(intent) {
+    hideSplash();
+    $("vaultMsg").textContent = t(intent === "capture" ? "capture_unlock" : "commands_unlock");
+    $("unlockPass").focus();
+  },
+  async refreshProfiles() {
+    if (!await loadProfiles()) throw new Error(t("profiles_unavailable"));
+    return profiles;
+  },
+  createProfile: name => invoke("create_profile", { name }),
+  onError: sessionError,
+  async onCommandError(error) { if (!await sessionError(error)) await sysAlert("❌ " + error); },
+  prepareNavigation: prepareCommandNavigation,
+  async navigate(item) {
+    if (item.kind === "folder") return organizationCenter.openFolder(item.id);
+    if (item.kind === "note") {
+      const note = await invoke("get_note", { id: item.id });
+      if (!$("mainView").classList.contains("hidden")) await viewNote(note);
+    } else if (item.kind === "profile") {
+      clearQueryFilters();
+      await loadProfiles();
+      currentProfile = profiles.find(p => p.id === item.id) || null;
+      renderProfiles();
+      await loadNotes();
+    } else if (item.kind === "tag") {
+      clearQueryFilters();
+      currentProfile = null;
+      selectedTag = item.id;
+      await loadProfiles();
+      await applyTagSearch();
+    }
+  },
+  async runAction(id) {
+    if (id === "lock") return lockAndReload();
+    if (id === "new") {
+      await loadProfiles();
+      currentProfile = profiles.find(p => p.id === currentProfile?.id) || profiles[0] || null;
+      renderProfiles();
+      return $("newNoteBtn").onclick();
+    }
+    const handlers = { drafts: openDrafts, dashboard: $("dashBtn").onclick, graph: $("graphBtn").onclick,
+      backup: $("doBackupBtn").onclick, backups: openBackups, trash: loadTrash, search: () => $("q").focus(),
+      folders: () => $("newFolderBtn").focus(), save_search: () => organizationCenter.openFolderEditor(),
+      import: () => transferCenter.open("import"), export: () => transferCenter.open("export") };
+    if (handlers[id]) await handlers[id]();
+  },
+  onDraftsChanged: refreshDraftCount,
+  async onCaptured(profileId) {
+    organizationCenter?.refreshFolders();
+    if (editorSession) return;
+    if (organizationCenter?.activeFolderId()) { await refreshCurrentNotesView(); return; }
+    await loadProfiles();
+    currentProfile = profiles.find(p => p.id === profileId) || currentProfile;
+    clearQueryFilters();
+    renderProfiles();
+    await loadNotes();
+  },
+  async openFullEditor(draftId, profileId) {
+    if (!await prepareCommandNavigation()) return;
+    await openEditor({ draft_id: draftId, profile_id: profileId });
+  },
+});
+
+async function refreshCurrentNotesView() {
+  const folder = organizationCenter?.activeFolderId();
+  if (folder) await organizationCenter.openFolder(folder, { prepare: false });
+  else await loadNotes();
+}
+
+organizationCenter = window.SecureNotesOrganization.create({
+  t: key => t(key), invoke: (cmd, args) => invoke(cmd, args), onError: sessionError, alert: sysAlert, confirm: sysConfirm,
+  preview: notePreview,
+  activity: recordActivity, commandsOpen: () => commandCenter?.isOpen(),
+  state: () => ({ unlocked: !$("mainView").classList.contains("hidden"), profiles, viewingNote }),
+  currentSearch: searchParams, beginView: () => ++notesViewEpoch, isCurrentView: epoch => epoch === notesViewEpoch,
+  prepareNavigation: prepareCommandNavigation,
+  async refreshProfiles() { if (!await loadProfiles()) throw new Error(t("profiles_unavailable")); return profiles; },
+  applyFolder({ folder, notes }) {
+    const p = folder.params;
+    $("q").value = p.query || ""; selectedTag = p.tag || null;
+    $("dfrom").value = p.date_from ? new Date(p.date_from).toISOString().slice(0, 10) : "";
+    const end = p.date_to ? new Date(p.date_to) : null; if (end) end.setUTCDate(end.getUTCDate() - 1);
+    $("dto").value = end ? end.toISOString().slice(0, 10) : "";
+    currentProfile = p.profile_id ? profiles.find(profile => profile.id === p.profile_id) || { id: p.profile_id, name: t("folder_deleted_profile") } : null;
+    currentNotes = notes; exitTrashMode(); renderProfiles(); renderNotes(notes); refreshTagBar();
+    $("currentProfileTitle").textContent = t("folder_results").replace("{name}", folder.name).replace("{count}", notes.length);
+  },
+  async onFolderRemoved() {
+    clearQueryFilters(); currentProfile = profiles.find(p => p.id === currentProfile?.id) || profiles[0] || null;
+    if (currentProfile) await loadNotes(); else { renderNotes([]); $("currentProfileTitle").textContent = t("select_profile"); }
+  },
+  viewNote,
+  async onNotesChanged() { await loadProfiles(); await refreshTrashCount(); if (organizationCenter?.activeFolderId()) await refreshCurrentNotesView(); },
+  async editNote(id) { if (await prepareCommandNavigation()) await openEditor({ note_id: id }); },
+});
+
+function stableReference(note) {
+  const label = note.is_locked ? t("commands_locked") : note.title || t("commands_untitled");
+  return `[[${note.id}|${[...label.replace(/\]/g, "］")].slice(0, 80).join("")}]]`;
+}
+$("pickNoteLinkBtn").onclick = () => {
+  if (!editorSession) return;
+  const token = editorSession.token, field = $("noteContent");
+  const start = field.selectionStart ?? field.value.length, end = field.selectionEnd ?? start;
+  return commandCenter.pickNote(note => {
+    if (editorSession?.token !== token) return;
+    const link = stableReference(note);
+    field.value = field.value.slice(0, start) + link + field.value.slice(end);
+    field.selectionStart = field.selectionEnd = start + link.length; field.focus(); markNoteDirty();
+  });
+};
+$("stableLinkBtn").onclick = () => viewingNote && sysDialog({ title: t("links_copy_title"), msg: t("links_copy_hint"), input: true, value: stableReference(viewingNote), readonly: true, showCancel: false, okText: t("close_btn") });
+
+transferCenter = window.SecureNotesTransfer.create({
+  t: key => t(key), invoke: (cmd, args) => invoke(cmd, args), onError: sessionError, prepareNavigation: prepareCommandNavigation,
+  activity: recordActivity, commandsOpen: () => commandCenter?.isOpen(), organizationOpen: () => organizationCenter?.isOpen(),
+  state: () => ({ unlocked: !$("mainView").classList.contains("hidden"), currentProfileId: currentProfile?.id }),
+  selection: () => viewingNote ? [viewingNote.id] : currentNotes.map(note => note.id),
+  async refreshProfiles() { if (!await loadProfiles()) throw new Error(t("profiles_unavailable")); return profiles; },
+  async onImported(result) {
+    await loadProfiles(); await refreshTrashCount();
+    if (editorSession || commandCenter?.hasCapture()) return;
+    if (organizationCenter?.activeFolderId()) { await refreshCurrentNotesView(); return; }
+    currentProfile = profiles.find(p => p.id === result.profile_id) || currentProfile || profiles[0] || null;
+    clearQueryFilters(); renderProfiles(); await loadNotes();
+  },
+});

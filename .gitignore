@@ -1,8 +1,11 @@
 # Dépendances & build
 node_modules/
 src-tauri/target/
+src-tauri/gen/schemas/
+__pycache__/
 
 # Coffres chiffrés, sauvegardes et secrets : NE JAMAIS COMMITER
 *.snotevault
+*.snotevault.bak
 *.log
 .env

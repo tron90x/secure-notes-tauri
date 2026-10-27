@@ -1,9 +1,11 @@
 {
   "name": "securenotes-frontend",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.3.0-dev",
   "type": "module",
   "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "test:desktop": "python3 tests/desktop-smoke.py",
     "tauri": "tauri"
   },
   "devDependencies": {

@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>SecureNotes — carnet chiffré</title>
+  <defs>
+    <linearGradient id="background" x1="120" y1="80" x2="900" y2="960" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#132846"/>
+      <stop offset=".52" stop-color="#171b3c"/>
+      <stop offset="1" stop-color="#49317b"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="280" y1="176" x2="740" y2="848" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dce9ff"/>
+    </linearGradient>
+    <linearGradient id="binding" x1="264" y1="176" x2="320" y2="848" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#53e4f5"/>
+      <stop offset="1" stop-color="#818cf8"/>
+    </linearGradient>
+    <linearGradient id="lock" x1="416" y1="512" x2="736" y2="752" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#25365a"/>
+      <stop offset="1" stop-color="#39255e"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="432" y1="512" x2="704" y2="752" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#background)"/>
+  <rect x="48" y="48" width="928" height="928" rx="208" fill="none" stroke="#a5b4fc" stroke-opacity=".16" stroke-width="4"/>
+  <path d="M318 196H620L788 364V784Q788 868 704 868H318Q234 868 234 784V280Q234 196 318 196Z" fill="#050b1d" fill-opacity=".35"/>
+  <path d="M320 176H608L768 336V768Q768 848 688 848H320Q240 848 240 768V256Q240 176 320 176Z" fill="url(#paper)"/>
+  <path d="M320 176H328V848H320Q240 848 240 768V256Q240 176 320 176Z" fill="url(#binding)"/>
+  <path d="M608 176V288Q608 336 656 336H768Z" fill="#b8c8f4"/>
+  <path d="M608 176L768 336H656Q608 336 608 288Z" fill="#d5dfff"/>
+  <g fill="#152641">
+    <rect x="208" y="296" width="80" height="28" rx="14"/>
+    <rect x="208" y="448" width="80" height="28" rx="14"/>
+    <rect x="208" y="600" width="80" height="28" rx="14"/>
+    <rect x="208" y="752" width="80" height="28" rx="14"/>
+  </g>
+  <rect x="376" y="296" width="152" height="24" rx="12" fill="#94a6ce"/>
+  <rect x="376" y="360" width="240" height="24" rx="12" fill="#b5c4e2"/>
+  <path d="M480 520V458A88 88 0 0 1 656 458V520" fill="none" stroke="#152641" stroke-width="44" stroke-linecap="round"/>
+  <path d="M480 514V458A88 88 0 0 1 656 458V514" fill="none" stroke="#53638c" stroke-width="20" stroke-linecap="round"/>
+  <rect x="408" y="504" width="320" height="248" rx="56" fill="url(#rim)"/>
+  <rect x="420" y="516" width="296" height="224" rx="44" fill="url(#lock)"/>
+  <circle cx="568" cy="602" r="25" fill="#67e8f9"/>
+  <rect x="554" y="602" width="28" height="68" rx="14" fill="#67e8f9"/>
+</svg>

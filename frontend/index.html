@@ -4,8 +4,12 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>SecureNotes — Coffre chiffré</title>
+<link rel="icon" type="image/svg+xml" href="icon.svg" />
 <link rel="stylesheet" href="styles.css" />
 <script src="lang.js"></script>
+<script src="commands.js"></script>
+<script src="organization.js"></script>
+<script src="transfer.js"></script>
 <script type="module" src="app.js"></script>
 </head>
 <body>
@@ -14,7 +18,7 @@
 
 <!-- SPLASH -->
 <div id="splash" class="splash">
-  <div class="splash-logo">🔐</div>
+  <div class="splash-logo"><img src="icon.svg" width="96" height="96" alt="" /></div>
   <h1 class="splash-title">Secure<span>Notes</span></h1>
   <div class="splash-bar"><div class="splash-fill"></div></div>
   <p class="splash-sub" data-i18n="splash_sub">Chiffrement AES-256-GCM • Argon2id • Zéro-connaissance</p>
@@ -31,8 +35,8 @@
     <h2 data-i18n="vault_title">🔐 Vos coffres chiffrés</h2>
     <p class="muted" data-i18n="vault_desc">Chaque base <b>.snotevault</b> est chiffrée intégralement (AES-256-GCM, clé Argon2id).</p>
     <div class="row">
-      <select id="vaultSelect"></select>
-      <button id="refreshVaults" class="btn ghost">↻</button>
+      <select id="vaultSelect" data-i18n-aria="select_base"></select>
+      <button id="refreshVaults" class="btn ghost" data-i18n-title="refresh_vaults" data-i18n-aria="refresh_vaults">↻</button>
     </div>
     <input id="unlockPass" type="password" data-i18n-ph="unlock_pass_ph" placeholder="Mot de passe de la base" />
     <button id="unlockBtn" class="btn primary" data-i18n="unlock_btn">Déchiffrer & Ouvrir ✨</button>
@@ -50,17 +54,23 @@
 <!-- MAIN -->
 <div id="mainView" class="view hidden">
   <header class="topbar glass">
-    <div class="brand">🔐 Secure<span>Notes</span></div>
+    <div class="brand"><img class="brand-icon" src="icon.svg" width="32" height="32" alt="" /> Secure<span>Notes</span></div>
     <div class="searchbar">
-      <input id="q" placeholder="🔍 Recherche avancée : mots-clés..." data-i18n-ph="search_ph" />
-      <input id="dfrom" type="date" title="Date début" />
-      <input id="dto" type="date" title="Date fin" />
+      <input id="q" maxlength="1000" placeholder="🔍 Mots, tag:travail, modifiee:7j…" data-i18n-ph="search_ph" />
+      <input id="dfrom" type="date" data-i18n-title="date_from" data-i18n-aria="date_from" title="Date début" />
+      <input id="dto" type="date" data-i18n-title="date_to" data-i18n-aria="date_to" title="Date fin" />
       <button id="searchBtn" class="btn small primary" data-i18n="search_btn">Rechercher</button>
       <button id="clearSearchBtn" class="btn small ghost" data-i18n="clear_btn">Effacer</button>
+      <button id="saveSearchBtn" class="btn small secondary" data-i18n="folder_save_search">📂 Enregistrer la recherche</button>
+      <button id="searchHelpBtn" class="btn small ghost" data-i18n-title="search_help_title" title="Syntaxe de recherche">?</button>
     </div>
     <div id="tagBar" class="tagbar"></div>
+    <button id="commandsBtn" class="btn ghost" title="Ctrl+K"><span data-i18n="commands_btn">⌘ Commandes</span> <kbd>Ctrl K</kbd></button>
+    <button id="quickCaptureBtn" class="btn ghost" title="Ctrl+Shift+N" data-i18n="capture_btn">⚡ Capture rapide</button>
     <button id="graphBtn" class="btn ghost" data-i18n="graph_btn">🕸 Graphe</button>
-    <button id="backupBtn" class="btn ghost">📦</button>
+    <button id="backupBtn" class="btn ghost" data-i18n-title="backup_title" data-i18n-aria="backup_title">📦</button>
+    <button id="draftsBtn" class="btn ghost"><span data-i18n="drafts_btn">📝 Brouillons</span> (<span id="draftCount">0</span>)</button>
+    <button id="transferBtn" class="btn ghost" data-i18n="transfer_btn">⇄ Import / Export</button>
     <button id="dashBtn" class="btn ghost" data-i18n="dashboard_btn">📊 Dashboard</button>
     <button id="lockBtn" class="btn ghost" data-i18n="lock_btn">🔒 Verrouiller</button>
   </header>
@@ -68,8 +78,13 @@
   <div class="layout">
     <aside class="sidebar glass">
       <h3 data-i18n="profiles_title">👤 Profils</h3>
-      <div class="row"><input id="profileName" placeholder="Nouveau profil..." data-i18n-ph="new_profile_ph" /><button id="addProfileBtn" class="btn small primary">＋</button></div>
+      <div class="row"><input id="profileName" placeholder="Nouveau profil..." data-i18n-ph="new_profile_ph" /><button id="addProfileBtn" class="btn small primary" data-i18n-title="add_profile" data-i18n-aria="add_profile">＋</button></div>
       <div id="profileList"></div>
+      <section class="smart-folders" aria-labelledby="foldersHeading">
+        <div class="row command-heading"><h3 id="foldersHeading" data-i18n="folders_title">📂 Dossiers intelligents</h3><button id="newFolderBtn" class="btn small ghost" data-i18n-title="folder_new" title="Nouveau dossier">＋</button></div>
+        <p id="foldersStatus" class="muted" role="status" aria-live="polite"></p>
+        <div id="foldersList" class="folders-list"></div>
+      </section>
       <button id="showTrashBtn" class="btn small ghost" data-i18n="trash_btn">🗑 Corbeille (<span id="trashCount">0</span>)</button>
       <div class="row auto-lock-row"><label class="muted" for="autoLock" data-i18n="auto_lock_label">🔒 Verrou auto</label><select id="autoLock">
         <option value="60">1 min</option><option value="300" selected>5 min</option>
@@ -81,7 +96,7 @@
       <div class="content-head">
         <h2 id="currentProfileTitle">Sélectionnez un profil</h2>
         <div class="row">
-          <button id="emptyTrashBtn" class="btn small danger hidden">Vider la corbeille</button>
+          <button id="emptyTrashBtn" class="btn small danger hidden" data-i18n="empty_trash_btn">Vider la corbeille</button>
           <button id="newNoteBtn" class="btn primary" data-i18n="new_note_btn">＋ Nouvelle note</button>
         </div>
       </div>
@@ -98,6 +113,7 @@
     <textarea id="noteContent" rows="7" placeholder="Contenu... (astuce : [[Titre d'une note]] crée un lien)" data-i18n-ph="note_content_ph"></textarea>
     <div class="row" id="insertBar" style="gap:6px;flex-wrap:wrap;margin:6px 0">
       <button type="button" class="btn small ghost" data-insert="link" data-i18n-title="ins_link" title="Insérer un lien [[Titre]]">⟦⟧</button>
+      <button type="button" id="pickNoteLinkBtn" class="btn small secondary" data-i18n="links_choose">🔗 Choisir une note</button>
       <button type="button" class="btn small ghost" data-insert="person" data-i18n-title="ins_person" title="Insérer une personne @nom">@</button>
       <button type="button" class="btn small ghost" data-insert="place" data-i18n-title="ins_place" title="Insérer un lieu 📍nom">📍</button>
       <button type="button" class="btn small ghost" data-insert="idea" data-i18n-title="ins_idea" title="Insérer une idée 💡nom">💡</button>
@@ -110,13 +126,18 @@
       <input id="tagInput" placeholder="+ tag (Entrée pour ajouter)" data-i18n-ph="tag_input_ph" />
     </div>
     <div class="row">
-      <input id="notePass" type="password" placeholder="🔒 Mot de passe individuel (optionnel)" data-i18n-ph="note_pass_ph" />
+      <select id="noteProtection" aria-label="Protection de la note" data-i18n-aria="protection_label">
+        <option value="keep" data-i18n="protection_keep">Conserver la protection actuelle</option>
+        <option value="set" data-i18n="protection_set">Définir / changer le mot de passe</option>
+        <option value="remove" data-i18n="protection_remove">Retirer la protection individuelle</option>
+      </select>
+      <input id="notePass" type="password" autocomplete="new-password" disabled placeholder="Nouveau mot de passe (min 4 caractères)" data-i18n-ph="editor_password_ph" />
     </div>
     <div class="row">
       <label><span data-i18n="wallpaper_label">Fond :</span> <select id="noteWallpaper">
-        <option value="aurora">Aurora</option><option value="sunset">Sunset</option>
-        <option value="ocean">Ocean</option><option value="neon">Néon</option>
-        <option value="sakura">Sakura</option><option value="carbon">Carbon</option>
+        <option value="aurora" data-i18n="wall_aurora">Aurore</option><option value="sunset" data-i18n="wall_sunset">Coucher de soleil</option>
+        <option value="ocean" data-i18n="wall_ocean">Océan</option><option value="neon" data-i18n="wall_neon">Néon</option>
+        <option value="sakura" data-i18n="wall_sakura">Cerisier</option><option value="carbon" data-i18n="wall_carbon">Carbone</option>
       </select></label>
       <label class="chk"><input type="checkbox" id="noteGlass" checked /> <span data-i18n="glass_label">Effet glass ✨</span></label>
     </div>
@@ -124,8 +145,10 @@
       <input type="file" id="noteFile" data-i18n-title="file_title" title="Choisir un fichier" />
       <span id="fileHint" class="muted"></span>
     </div>
+    <label class="chk"><input type="checkbox" id="removeAttachment" /> <span data-i18n="remove_attachment">Supprimer la pièce jointe existante</span></label>
+    <p id="saveStatus" class="muted" role="status" aria-live="polite"></p>
     <div class="row end">
-      <button id="cancelNoteBtn" class="btn ghost" data-i18n="cancel_btn">Annuler</button>
+      <button id="cancelNoteBtn" class="btn ghost" data-i18n="editor_close">Fermer</button>
       <button id="saveNoteBtn" class="btn primary" data-i18n="save_btn">💾 Enregistrer (chiffré)</button>
     </div>
   </div>
@@ -136,26 +159,31 @@
   <div class="modal-card glass" id="viewCard">
     <h3 id="vTitle"></h3>
     <details class="dates-dropdown">
-      <summary>🕓 Dates : création & modifications</summary>
+      <summary data-i18n="dates_summary">🕓 Dates : création et modifications</summary>
       <div id="vMeta" class="muted dates-body"></div>
     </details>
     <div class="note-focus-wrap">
       <div id="vContent" class="note-content"></div>
     <div id="vTags" class="tag-pills view-tags"></div>
-      <button id="expandBtn" class="expand-btn" title="Agrandir la lecture">＋</button>
+      <button id="expandBtn" class="expand-btn" title="Agrandir la lecture" data-i18n-title="expand_reading" data-i18n-aria="expand_reading">＋</button>
     </div>
     <div class="hl-toolbar">
       <span class="muted" data-i18n="hl_hint">🖍 Sélectionnez un mot/phrase puis :</span>
       <div class="hl-colors">
-        <button class="hl-dot hl-yellow" data-color="yellow" title="Jaune">●</button>
-        <button class="hl-dot hl-green" data-color="green" title="Vert">●</button>
-        <button class="hl-dot hl-pink" data-color="pink" title="Rose">●</button>
-        <button class="hl-dot hl-blue" data-color="blue" title="Bleu">●</button>
-        <button class="hl-dot hl-orange" data-color="orange" title="Orange">●</button>
+        <button class="hl-dot hl-yellow" data-color="yellow" title="Jaune" data-i18n-title="color_yellow" data-i18n-aria="color_yellow">●</button>
+        <button class="hl-dot hl-green" data-color="green" title="Vert" data-i18n-title="color_green" data-i18n-aria="color_green">●</button>
+        <button class="hl-dot hl-pink" data-color="pink" title="Rose" data-i18n-title="color_pink" data-i18n-aria="color_pink">●</button>
+        <button class="hl-dot hl-blue" data-color="blue" title="Bleu" data-i18n-title="color_blue" data-i18n-aria="color_blue">●</button>
+        <button class="hl-dot hl-orange" data-color="orange" title="Orange" data-i18n-title="color_orange" data-i18n-aria="color_orange">●</button>
       </div>
       <button id="clearHlBtn" class="btn small ghost" title="Cliquez sur un surlignage existant pour le supprimer" data-i18n="clear_hl_btn" data-i18n-title="clear_hl_btn">🧽 Cliquez sur un surlignage pour le retirer</button>
     </div>
     <div id="vAttach"></div>
+    <details id="noteContext" class="dates-dropdown" open>
+      <summary data-i18n="links_context">🔗 Liens et contexte</summary>
+      <p id="contextStatus" class="muted" role="status" aria-live="polite"></p>
+      <div class="context-columns"><section><h4 id="incomingTitle" data-i18n="links_incoming">Liens entrants</h4><div id="incomingLinks"></div></section><section><h4 id="outgoingTitle" data-i18n="links_outgoing">Liens sortants</h4><div id="outgoingLinks"></div></section></div>
+    </details>
     <details class="dates-dropdown">
       <summary id="vVerSum" data-i18n="versions_prev">📜 Versions précédentes</summary>
       <div id="vVersions"></div>
@@ -163,6 +191,8 @@
     <div class="row end">
       <button id="closeViewBtn" class="btn ghost" data-i18n="close_btn">✕ Fermer</button>
       <button id="editViewBtn" class="btn secondary" data-i18n="edit_btn">✏️ Modifier</button>
+      <button id="stableLinkBtn" class="btn ghost" data-i18n="links_stable">Lien stable</button>
+      <button id="relockViewBtn" class="btn secondary hidden" data-i18n="relock_note">🔒 Reverrouiller la note</button>
       <button id="delViewBtn" class="btn danger" data-i18n="del_btn">🗑 Corbeille</button>
     </div>
   </div>
@@ -173,12 +203,88 @@
     <h3 id="fTitle"></h3>
     <div id="focusContent" class="note-content focus-content"></div>
     <div class="row end">
-      <button id="closeFocusBtn" class="btn ghost">✕ Réduire</button>
+      <button id="closeFocusBtn" class="btn ghost" data-i18n="reduce_reading">✕ Réduire</button>
     </div>
   </div>
 </div>
 <!-- MODALE SYSTÈME (alert / confirm / prompt) -->
-<div id="sysModal" class="modal hidden">
+<div id="transferModal" class="modal hidden transfer-overlay" role="dialog" aria-modal="true" aria-labelledby="transferTitle">
+  <div class="modal-card glass transfer-card">
+    <div class="row command-heading"><h3 id="transferTitle" data-i18n="transfer_title">Portabilité des notes</h3><button id="closeTransferBtn" class="btn small ghost" data-i18n="close_btn">Fermer</button></div>
+    <div class="row" role="tablist" aria-labelledby="transferTitle"><button id="transferExportTab" class="btn secondary" role="tab" aria-controls="transferExportPane" aria-selected="true" data-i18n="transfer_export_tab">Exporter</button><button id="transferImportTab" class="btn ghost" role="tab" aria-controls="transferImportPane" aria-selected="false" data-i18n="transfer_import_tab">Importer</button></div>
+    <section id="transferExportPane" role="tabpanel" aria-labelledby="transferExportTab">
+      <label for="transferFormat" data-i18n="transfer_format">Format</label><select id="transferFormat"><option value="encrypted" data-i18n="transfer_encrypted">Archive chiffrée (.snotetransfer)</option><option value="markdown" data-i18n="transfer_markdown">Markdown et pièces jointes — ZIP non chiffré</option><option value="text" data-i18n="transfer_text">Texte et pièces jointes — ZIP non chiffré</option></select>
+      <div id="transferPasswords" class="row"><input id="transferPassword" type="password" autocomplete="new-password" data-i18n-ph="transfer_password" placeholder="Mot de passe d’archive (min 8)" /><input id="transferConfirm" type="password" autocomplete="new-password" data-i18n-ph="transfer_confirm" placeholder="Confirmer le mot de passe" /></div>
+      <p class="muted" data-i18n="transfer_protection_hint">Les notes protégées conservent leur mot de passe individuel dans l’archive chiffrée.</p>
+      <div class="row"><label class="sr-only" for="transferProfile" data-i18n="capture_profile">Profil</label><select id="transferProfile"></select><input id="transferFilter" data-i18n-ph="transfer_filter" placeholder="Filtrer la sélection…" /></div>
+      <div class="row"><button id="transferSelectAll" class="btn small ghost" data-i18n="transfer_select_all">Cocher les visibles</button><button id="transferSelectNone" class="btn small ghost" data-i18n="transfer_select_none">Aucune</button></div>
+      <p id="transferSelection" class="muted"></p><div id="transferNotes" class="transfer-list"></div>
+      <div class="row end"><button id="exportNotesBtn" class="btn primary" data-i18n="transfer_download">Exporter la sélection</button></div>
+    </section>
+    <section id="transferImportPane" class="hidden" role="tabpanel" aria-labelledby="transferImportTab">
+      <div class="row"><button id="pickImportFilesBtn" class="btn secondary" data-i18n="transfer_pick_files">Choisir des fichiers</button><button id="pickImportFolderBtn" class="btn ghost" data-i18n="transfer_pick_folder">Choisir un dossier</button></div>
+      <input id="transferFiles" class="hidden" type="file" multiple accept=".md,.markdown,.txt,.zip,.snotetransfer" />
+      <p id="transferFileNames" class="muted"></p><input id="transferImportPassword" type="password" autocomplete="off" data-i18n-ph="transfer_import_password" placeholder="Mot de passe de l’archive chiffrée" />
+      <button id="prepareImportBtn" class="btn secondary" data-i18n="transfer_prepare">Préparer l’import</button>
+      <p id="transferPreviewSummary" class="muted" role="status" aria-live="polite"></p><div id="transferPreview" class="transfer-list"></div>
+      <label class="chk"><input id="transferPreserveProfiles" type="checkbox" checked /><span data-i18n="transfer_profiles">Créer ou réutiliser les profils d’origine</span></label>
+      <label class="sr-only" for="transferDestination" data-i18n="transfer_destination">Profil de destination</label><select id="transferDestination"></select>
+      <label class="chk"><input id="transferCopies" type="checkbox" /><span data-i18n="transfer_copies">Importer des copies (notes libres uniquement)</span></label>
+      <p class="muted" data-i18n="transfer_duplicates">Sans copies, les identifiants existants sont conservés sans écrasement.</p>
+      <div class="row end"><button id="commitImportBtn" class="btn primary" data-i18n="transfer_commit">Importer les notes préparées</button></div>
+    </section>
+    <p id="transferStatus" class="muted" role="status" aria-live="polite"></p>
+  </div>
+</div>
+<div id="folderModal" class="modal hidden organization-overlay" role="dialog" aria-modal="true" aria-labelledby="folderModalTitle">
+  <div class="modal-card glass organization-card">
+    <h3 id="folderModalTitle" data-i18n="folder_new">Nouveau dossier intelligent</h3>
+    <label for="folderName" data-i18n="folder_name">Nom</label><input id="folderName" maxlength="64" />
+    <label for="folderQuery" data-i18n="folder_query">Recherche</label><input id="folderQuery" maxlength="1000" data-i18n-ph="folder_query_hint" placeholder='tag:travail modifiee:7j -annulée' />
+    <label for="folderProfile" data-i18n="capture_profile">Profil</label><select id="folderProfile"></select>
+    <div class="row"><label><span data-i18n="folder_from">Du</span><input id="folderFrom" type="date" /></label><label><span data-i18n="folder_to">Au (inclus)</span><input id="folderTo" type="date" /></label></div>
+    <label for="folderTag" data-i18n="folder_tag">Tag exact (facultatif)</label><input id="folderTag" maxlength="24" />
+    <p class="muted" data-i18n="folder_hint">Les résultats se mettent à jour avec les notes. Les durées comme modifiee:7j restent relatives.</p>
+    <p id="folderStatus" class="muted" role="status" aria-live="polite"></p>
+    <div class="row end"><button id="cancelFolderBtn" class="btn ghost" data-i18n="cancel_btn">Annuler</button><button id="saveFolderBtn" class="btn primary" data-i18n="folder_save">Enregistrer le dossier</button></div>
+  </div>
+</div>
+<div id="referenceModal" class="modal hidden reference-overlay" role="dialog" aria-modal="true" aria-labelledby="referenceTitle">
+  <div class="modal-card glass organization-card"><h3 id="referenceTitle" data-i18n="links_context">Liens et contexte</h3>
+    <p id="referenceStatus" class="muted" role="status" aria-live="polite"></p><div id="referenceTargets"></div>
+    <div class="row end"><button id="closeReferenceBtn" class="btn ghost" data-i18n="close_btn">Fermer</button></div>
+  </div>
+</div>
+<div id="commandModal" class="modal hidden command-overlay" role="dialog" aria-modal="true" aria-labelledby="commandTitle">
+  <div class="modal-card glass command-card">
+    <div class="row command-heading"><h3 id="commandTitle" data-i18n="commands_title">Commandes et recherche</h3><button id="closeCommandsBtn" class="btn small ghost" data-i18n="close_btn">Fermer</button></div>
+    <label for="commandQuery" class="sr-only" data-i18n="commands_label">Rechercher une note ou une commande</label>
+    <input id="commandQuery" type="search" maxlength="200" autocomplete="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-controls="commandResults" aria-expanded="true" data-i18n-ph="commands_placeholder" placeholder="Notes, #tags, @profils, >commandes…" />
+    <p id="commandStatus" class="muted" role="status" aria-live="polite"></p>
+    <div id="commandResults" class="command-results" role="listbox" aria-labelledby="commandTitle"></div>
+    <p class="muted command-hint" data-i18n="commands_hint">↑ ↓ choisir · Entrée ouvrir · Échap fermer</p>
+  </div>
+</div>
+<div id="quickCaptureModal" class="modal hidden capture-overlay" role="dialog" aria-modal="true" aria-labelledby="quickCaptureTitle">
+  <div class="modal-card glass capture-card">
+    <div class="row command-heading"><h3 id="quickCaptureTitle" data-i18n="capture_title">⚡ Capture rapide</h3><button id="closeCaptureBtn" class="btn small ghost" data-i18n="editor_close">Fermer</button></div>
+    <p class="muted" data-i18n="capture_hint">Vos idées sont conservées dans des brouillons chiffrés.</p>
+    <label for="captureProfile" data-i18n="capture_profile">Profil</label>
+    <select id="captureProfile"></select>
+    <div id="captureProfileSetup" class="row hidden">
+      <input id="captureProfileName" data-i18n-ph="capture_profile_name" placeholder="Nom du profil" />
+      <button id="createCaptureProfileBtn" class="btn small secondary" data-i18n="capture_create_profile">Créer un profil</button>
+    </div>
+    <label for="captureTitle" class="sr-only" data-i18n="capture_note_title">Titre facultatif</label>
+    <input id="captureTitle" maxlength="200" disabled data-i18n-ph="capture_note_title" placeholder="Titre facultatif" />
+    <label for="captureContent" class="sr-only" data-i18n="capture_content">Une idée, une tâche, un lien…</label>
+    <textarea id="captureContent" rows="5" disabled data-i18n-ph="capture_content" placeholder="Une idée, une tâche, un lien…"></textarea>
+    <p id="captureStatus" class="muted" role="status" aria-live="polite"></p>
+    <div class="row end"><button id="captureFullBtn" class="btn secondary" disabled data-i18n="capture_full">Éditeur complet</button><button id="saveCaptureBtn" class="btn primary" disabled data-i18n="capture_save">Enregistrer la note</button></div>
+    <p class="muted command-hint" data-i18n="capture_keys">Ctrl+Entrée enregistrer · Échap conserver et fermer</p>
+  </div>
+</div>
+<div id="sysModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="sysTitle" aria-describedby="sysMsg">
   <div class="modal-card glass sys-card">
     <h3 id="sysTitle"></h3>
     <p id="sysMsg" class="sys-msg"></p>
@@ -205,8 +311,8 @@
       <div class="dash-panel wide"><h4 data-i18n="dash_activity_30d">📈 Activité — 30 derniers jours</h4>
         <canvas id="dashActivity"></canvas><div class="muted legend" data-i18n="dash_activity_legend">🟦 créations • 🟪 modifications</div>
       </div>
-      <div class="dash-panel"><h4>🔥 Streak d'écriture</h4><div id="dashStreak"></div>
-        <div class="row goal-row"><input id="goalInput" type="number" min="0" max="10000" placeholder="Objectif mots/jour" /><button id="goalSaveBtn" class="btn small secondary">OK</button></div>
+      <div class="dash-panel"><h4 data-i18n="streak_title">🔥 Série de jours d’écriture</h4><div id="dashStreak"></div>
+        <div class="row goal-row"><input id="goalInput" type="number" min="0" max="10000" placeholder="Objectif mots/jour" data-i18n-ph="goal_ph" data-i18n-aria="goal_ph" /><button id="goalSaveBtn" class="btn small secondary" data-i18n="ok_btn">OK</button></div>
       </div>
       <div class="dash-panel"><h4 data-i18n="dash_tag_cloud">🏷 Nuage de tags</h4><div id="dashTags" class="tag-cloud"></div></div>
       <div class="dash-panel"><h4 data-i18n="dash_highlights_color">🖍 Surlignages par couleur</h4><div id="dashColors"></div></div>
@@ -221,7 +327,7 @@
 <div id="graphModal" class="modal hidden">
   <div class="modal-card glass dash-card">
     <div class="row dash-head">
-      <h2><span data-i18n="graph_btn">🕸 Graphe</span> <span class="muted" style="font-size:13px">— cliquez un nœud pour ouvrir • glissez pour déplacer</span></h2>
+      <h2><span data-i18n="graph_btn">🕸 Graphe</span> <span class="muted" style="font-size:13px" data-i18n="graph_interaction">— cliquez un nœud pour ouvrir • glissez pour déplacer</span></h2>
       <button id="closeGraphBtn" class="btn ghost" data-i18n="close_btn">✕ Fermer</button>
     </div>
     <p class="muted"><span data-i18n="graph_hint">Liens <b>[[Titre]]</b> entre notes (les verrouillées sont exclues).</span> <span id="graphInfo"></span></p>
@@ -238,10 +344,18 @@
   </div>
 </div>
 <!-- BACKUPS -->
+<div id="draftsModal" class="modal hidden">
+  <div class="modal-card glass" style="max-width:760px">
+    <h3 data-i18n="drafts_title">Brouillons récupérables</h3>
+    <p class="muted" data-i18n="drafts_hint">Les brouillons sont chiffrés. Les notes protégées demandent leur mot de passe individuel.</p>
+    <div id="draftsList"></div>
+    <div class="row end"><button id="closeDraftsBtn" class="btn ghost" data-i18n="close_btn">Fermer</button></div>
+  </div>
+</div>
 <div id="backupModal" class="modal hidden">
   <div class="modal-card glass sys-card" style="max-width:520px">
     <h3 data-i18n="backup_title">📦 Sauvegardes chiffrées</h3>
-    <p class="muted">Copies horodatées du coffre (déjà chiffré), 10 max, +1 auto/heure à l'ouverture.</p>
+    <p class="muted" data-i18n="backup_hint">Copies horodatées du coffre (déjà chiffré), 10 max, +1 auto/heure à l'ouverture.</p>
     <div id="backupList"></div>
     <div class="row end">
       <button id="closeBackupBtn" class="btn ghost" data-i18n="close_btn">✕ Fermer</button>

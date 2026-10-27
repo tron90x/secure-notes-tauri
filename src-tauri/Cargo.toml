@@ -1,6 +1,6 @@
 [package]
 name = "secure-notes-tauri"
-version = "0.1.0"
+version = "0.3.0-dev"
 description = "App de prise de notes sophistiquée, chiffrée, moderne"
 edition = "2021"
 
@@ -19,6 +19,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
 base64 = "0.22"
 dirs = "5"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+pulldown-cmark = { version = "0.13", default-features = false }
+tauri-plugin-dialog = "2"
 
 [features]
 default = [ "custom-protocol" ]

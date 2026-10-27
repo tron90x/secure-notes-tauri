@@ -1,22 +1,30 @@
 mod crypto;
+mod commands;
+mod editor;
 mod models;
+mod search;
+mod links;
+mod transfer;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{Utc, Duration};
 use models::*;
-use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, sync::{Mutex, MutexGuard}};
+use std::{collections::{HashMap, HashSet}, fs, io::Write, path::{Path, PathBuf}, sync::{Mutex, MutexGuard}};
 use std::time::Instant;
-use tauri::State;
+use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 struct Session {
+    id: String,
     key: [u8; 32],
     vault_path: PathBuf,
     db: Database,
     /// true si ouvert via le mot de passe leurre (écritures routées vers le slot leurre).
     decoy: bool,
     has_decoy: bool,
+    editors: HashMap<String, editor::EditorSession>,
+    imports: HashMap<String, transfer::ImportPlan>,
 }
 
 // La clé ne doit jamais rester en mémoire après verrouillage / expiration.
@@ -42,17 +50,27 @@ fn active<'a>(guard: &'a mut MutexGuard<'_, AppInner>) -> Result<&'a mut Session
     if guard.session.is_none() {
         return Err("Coffre verrouillé".into());
     }
-    let expired = match guard.last_active {
-        Some(t) => t.elapsed().as_secs() > guard.timeout_secs,
-        None => false,
-    };
-    if expired {
-        guard.session = None; // Drop → zeroize de la clé
-        guard.last_active = None;
+    if expire_session(guard) {
         return Err("Session expirée par inactivité — reconnectez-vous".into());
     }
     guard.last_active = Some(Instant::now());
     guard.session.as_mut().ok_or_else(|| "Coffre verrouillé".into())
+}
+
+fn expire_session(inner: &mut AppInner) -> bool {
+    let expired = inner.session.is_some() && inner.last_active
+        .map(|t| t.elapsed().as_secs() >= inner.timeout_secs).unwrap_or(false);
+    if expired {
+        inner.session = None;
+        inner.last_active = None;
+    }
+    expired
+}
+
+#[tauri::command]
+fn touch_session(state: State<AppState>) -> Result<(), String> {
+    active(&mut state.0.lock().unwrap())?;
+    Ok(())
 }
 
 fn vault_dir() -> PathBuf {
@@ -61,8 +79,29 @@ fn vault_dir() -> PathBuf {
         .join("SecureNotes")
 }
 
-fn save_session(s: &Session) -> Result<(), String> {
-    let json = serde_json::to_vec(&s.db).map_err(|e| e.to_string())?;
+fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("Chemin de coffre invalide")?;
+    let temporary = parent.join(format!(".securenotes-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(|e| e.to_string())?;
+        file.write_all(data).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        fs::rename(&temporary, path).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result
+}
+
+fn save_database(s: &Session, db: &Database) -> Result<(), String> {
+    let json = Zeroizing::new(serde_json::to_vec(db).map_err(|e| e.to_string())?);
     let (nonce, ct) = crypto::encrypt_aes_gcm(&s.key, &json)?;
     // relire le fichier pour garder sel + nom (+ slot leurre le cas échéant)
     let raw = fs::read_to_string(&s.vault_path).map_err(|e| e.to_string())?;
@@ -75,8 +114,17 @@ fn save_session(s: &Session) -> Result<(), String> {
         vf.nonce = B64.encode(nonce);
         vf.ciphertext = B64.encode(ct);
     }
-    fs::write(&s.vault_path, serde_json::to_string_pretty(&vf).unwrap()).map_err(|e| e.to_string())?;
+    atomic_write(&s.vault_path, &serde_json::to_vec_pretty(&vf).map_err(|e| e.to_string())?)?;
     Ok(())
+}
+
+/// Les mutations ne deviennent visibles en mémoire qu'après une écriture réussie.
+fn mutate_database<T>(s: &mut Session, mutate: impl FnOnce(&mut Database) -> Result<T, String>) -> Result<T, String> {
+    let mut next = s.db.clone();
+    let out = mutate(&mut next)?;
+    save_database(s, &next)?;
+    s.db = next;
+    Ok(out)
 }
 
 /// Normalisation des tags : minuscules, max 24 caractères, max 12, dédupliqués.
@@ -95,6 +143,7 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
 
 #[tauri::command]
 fn create_vault(name: String, password: String, state: State<AppState>) -> Result<String, String> {
+    let password = Zeroizing::new(password);
     if name.trim().is_empty() { return Err("Nom de base requis".into()); }
     if password.chars().count() < 8 { return Err("Mot de passe trop court (min 8 caractères)".into()); }
     let dir = vault_dir();
@@ -104,9 +153,9 @@ fn create_vault(name: String, password: String, state: State<AppState>) -> Resul
     if path.exists() { return Err("Une base avec ce nom existe déjà".into()); }
 
     let salt = crypto::generate_salt();
-    let key = crypto::derive_key(&password, &salt)?;
+    let key = Zeroizing::new(crypto::derive_key(&password, &salt)?);
     let db = Database::default();
-    let json = serde_json::to_vec(&db).map_err(|e| e.to_string())?;
+    let json = Zeroizing::new(serde_json::to_vec(&db).map_err(|e| e.to_string())?);
     let (nonce, ct) = crypto::encrypt_aes_gcm(&key, &json)?;
 
     let vf = VaultFile {
@@ -119,11 +168,11 @@ fn create_vault(name: String, password: String, state: State<AppState>) -> Resul
         decoy_nonce: None,
         decoy_ciphertext: None,
     };
-    fs::write(&path, serde_json::to_string_pretty(&vf).unwrap()).map_err(|e| e.to_string())?;
+    atomic_write(&path, &serde_json::to_vec_pretty(&vf).map_err(|e| e.to_string())?)?;
 
     let mut inner = state.0.lock().unwrap();
     let timeout = if inner.timeout_secs == 0 { DEFAULT_TIMEOUT_SECS } else { inner.timeout_secs };
-    *inner = AppInner { session: Some(Session { key, vault_path: path.clone(), db, decoy: false, has_decoy: false }), last_active: Some(Instant::now()), timeout_secs: timeout };
+    *inner = AppInner { session: Some(Session { id: Uuid::new_v4().to_string(), key: *key, vault_path: path.clone(), db, decoy: false, has_decoy: false, editors: HashMap::new(), imports: HashMap::new() }), last_active: Some(Instant::now()), timeout_secs: timeout };
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -145,20 +194,22 @@ fn list_vaults() -> Result<Vec<(String, String)>, String> {
 
 #[tauri::command]
 fn unlock_vault(path: String, password: String, state: State<AppState>) -> Result<String, String> {
+    let password = Zeroizing::new(password);
     let raw = fs::read_to_string(&path).map_err(|_| "Base introuvable".to_string())?;
     let vf: VaultFile = serde_json::from_str(&raw).map_err(|_| "Fichier corrompu".to_string())?;
     let salt = B64.decode(&vf.salt).map_err(|e| e.to_string())?;
     let nonce = B64.decode(&vf.nonce).map_err(|e| e.to_string())?;
     let ct = B64.decode(&vf.ciphertext).map_err(|e| e.to_string())?;
-    let key = crypto::derive_key(&password, &salt)?;
+    let key = Zeroizing::new(crypto::derive_key(&password, &salt)?);
     let has_decoy = vf.decoy_ciphertext.is_some();
     match crypto::decrypt_aes_gcm(&key, &nonce, &ct) {
         Ok(plain) => {
+            let plain = Zeroizing::new(plain);
             let db: Database = serde_json::from_slice(&plain).map_err(|_| "Base corrompue".to_string())?;
             let name = vf.name.clone();
             let mut inner = state.0.lock().unwrap();
             let timeout = if inner.timeout_secs == 0 { DEFAULT_TIMEOUT_SECS } else { inner.timeout_secs };
-            *inner = AppInner { session: Some(Session { key, vault_path: PathBuf::from(&path), db, decoy: false, has_decoy }), last_active: Some(Instant::now()), timeout_secs: timeout };
+            *inner = AppInner { session: Some(Session { id: Uuid::new_v4().to_string(), key: *key, vault_path: PathBuf::from(&path), db, decoy: false, has_decoy, editors: HashMap::new(), imports: HashMap::new() }), last_active: Some(Instant::now()), timeout_secs: timeout };
             drop(inner);
             auto_backup(&path); // sauvegarde auto (1/h max), erreurs silencieuses
             Ok(name)
@@ -168,12 +219,14 @@ fn unlock_vault(path: String, password: String, state: State<AppState>) -> Resul
             if let (Some(ds), Some(dn), Some(dc)) = (vf.decoy_salt, vf.decoy_nonce, vf.decoy_ciphertext) {
                 if let (Ok(dsalt), Ok(dnonce), Ok(dct)) = (B64.decode(&ds), B64.decode(&dn), B64.decode(&dc)) {
                     if let Ok(dkey) = crypto::derive_key(&password, &dsalt) {
+                        let dkey = Zeroizing::new(dkey);
                         if let Ok(plain) = crypto::decrypt_aes_gcm(&dkey, &dnonce, &dct) {
+                            let plain = Zeroizing::new(plain);
                             if let Ok(db) = serde_json::from_slice::<Database>(&plain) {
                                 let name = vf.name.clone();
                                 let mut inner = state.0.lock().unwrap();
                                 let timeout = if inner.timeout_secs == 0 { DEFAULT_TIMEOUT_SECS } else { inner.timeout_secs };
-                                *inner = AppInner { session: Some(Session { key: dkey, vault_path: PathBuf::from(path), db, decoy: true, has_decoy: true }), last_active: Some(Instant::now()), timeout_secs: timeout };
+                                *inner = AppInner { session: Some(Session { id: Uuid::new_v4().to_string(), key: *dkey, vault_path: PathBuf::from(path), db, decoy: true, has_decoy: true, editors: HashMap::new(), imports: HashMap::new() }), last_active: Some(Instant::now()), timeout_secs: timeout };
                                 return Ok(name);
                             }
                         }
@@ -195,22 +248,40 @@ fn vault_stem(path: &str) -> String {
     PathBuf::from(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "coffre".into())
 }
 
+fn backup_prefix(path: &str) -> String {
+    // Le suffixe horodaté est validé séparément pour éviter les préfixes ambigus.
+    format!("{}-", vault_stem(path))
+}
+
+fn belongs_to_vault(name: &str, path: &str) -> bool {
+    let prefix = backup_prefix(path);
+    let Some(stamp) = name.strip_prefix(&prefix).and_then(|n| n.strip_suffix(".snotevault.bak")) else { return false; };
+    // Noms historiques : YYYYMMDD-HHMMSS ; nouveaux : timestamp + UUID.
+    stamp.len() >= 15 && stamp.as_bytes()[8] == b'-'
+        && stamp.as_bytes()[..8].iter().all(|b| b.is_ascii_digit())
+        && stamp.as_bytes()[9..15].iter().all(|b| b.is_ascii_digit())
+        && (stamp.len() == 15 || stamp.as_bytes()[15] == b'-')
+}
+
 /// Copie horodatée du .snotevault (déjà chiffré), max 10 par coffre.
 fn do_backup(path: &str) -> Result<String, String> {
-    let dir = backups_dir();
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    do_backup_in(path, &backups_dir())
+}
+
+fn do_backup_in(path: &str, dir: &Path) -> Result<String, String> {
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let stem = vault_stem(path);
-    let dest = dir.join(format!("{}-{}.snotevault.bak", stem, Utc::now().format("%Y%m%d-%H%M%S")));
+    let dest = dir.join(format!("{}-{}-{}.snotevault.bak", stem, Utc::now().format("%Y%m%d-%H%M%S"), Uuid::new_v4()));
     let data = fs::read(path).map_err(|e| e.to_string())?;
-    fs::write(&dest, data).map_err(|e| e.to_string())?;
+    atomic_write(&dest, &data)?;
     // rotation : garder les 10 plus récentes
-    let mut files: Vec<_> = fs::read_dir(&dir).map_err(|e| e.to_string())?
+    let mut files: Vec<_> = fs::read_dir(dir).map_err(|e| e.to_string())?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.file_name().map(|n| n.to_string_lossy().starts_with(&stem)).unwrap_or(false))
+        .filter(|p| p.file_name().map(|n| belongs_to_vault(&n.to_string_lossy(), path)).unwrap_or(false))
         .collect();
     files.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
     files.reverse();
-    for old in files.into_iter().skip(10) {
+    for old in files.into_iter().filter(|p| p != &dest).skip(9) {
         let _ = fs::remove_file(old);
     }
     Ok(dest.file_name().unwrap().to_string_lossy().to_string())
@@ -218,14 +289,13 @@ fn do_backup(path: &str) -> Result<String, String> {
 
 /// Sauvegarde auto à l'ouverture, au plus 1/heure et par coffre.
 fn auto_backup(path: &str) {
-    let stem = vault_stem(path);
     let dir = backups_dir();
-    let recent = fs::read_dir(&dir).ok().map(|rd| {
+    let recent = fs::read_dir(&dir).ok().and_then(|rd| {
         rd.filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.file_name().map(|n| n.to_string_lossy().starts_with(&stem)).unwrap_or(false))
+            .filter(|p| p.file_name().map(|n| belongs_to_vault(&n.to_string_lossy(), path)).unwrap_or(false))
             .filter_map(|p| fs::metadata(&p).and_then(|m| m.modified()).ok())
             .max()
-    }).flatten();
+    });
     let stale = recent.map(|t| t.elapsed().map(|e| e.as_secs() > 3600).unwrap_or(true)).unwrap_or(true);
     if stale {
         let _ = do_backup(path);
@@ -252,7 +322,7 @@ fn list_backups(state: State<AppState>) -> Result<Vec<BackupInfo>, String> {
     for e in fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let e = e.map_err(|e| e.to_string())?;
         let p = e.path();
-        if p.extension().map(|x| x == "bak").unwrap_or(false) {
+        if p.file_name().map(|n| belongs_to_vault(&n.to_string_lossy(), &s.vault_path.to_string_lossy())).unwrap_or(false) {
             let m = e.metadata().map_err(|e| e.to_string())?;
             let modified = m.modified().ok().map(chrono::DateTime::<Utc>::from);
             out.push(BackupInfo {
@@ -276,21 +346,32 @@ fn restore_backup(name: String, state: State<AppState>) -> Result<(), String> {
     if s.decoy { return Err("Fonction indisponible".into()); }
     let src = backups_dir().join(&name);
     if !src.exists() { return Err("Sauvegarde introuvable".into()); }
-    // filet de sécurité : copier l'état actuel avant restauration
-    let path = s.vault_path.clone();
-    drop(guard);
-    let _ = do_backup(&path.to_string_lossy());
-    let mut guard = state.0.lock().unwrap();
-    let s = active(&mut guard)?;
-    if s.vault_path != path { return Err("Coffre changé entre-temps".into()); }
-    fs::copy(&src, &path).map_err(|e| e.to_string())?;
-    // recharge la base depuis le disque (même sel → même clé)
-    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let vf: VaultFile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    restore_backup_file(s, &src, &backups_dir())?;
+    Ok(())
+}
+
+fn restore_backup_file(s: &mut Session, src: &Path, backup_dir: &Path) -> Result<(), String> {
+    let name = src.file_name().ok_or("Nom invalide")?.to_string_lossy();
+    if !belongs_to_vault(&name, &s.vault_path.to_string_lossy()) {
+        return Err("Cette sauvegarde appartient à un autre coffre".into());
+    }
+    let raw = fs::read(src).map_err(|e| e.to_string())?;
+    let vf: VaultFile = serde_json::from_slice(&raw).map_err(|_| "Sauvegarde corrompue".to_string())?;
+    let current: VaultFile = serde_json::from_slice(&fs::read(&s.vault_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    if vf.salt != current.salt || vf.version != current.version {
+        return Err("Sauvegarde incompatible avec ce coffre".into());
+    }
     let nonce = B64.decode(&vf.nonce).map_err(|e| e.to_string())?;
     let ct = B64.decode(&vf.ciphertext).map_err(|e| e.to_string())?;
-    let plain = crypto::decrypt_aes_gcm(&s.key, &nonce, &ct)?;
-    s.db = serde_json::from_slice(&plain).map_err(|_| "Sauvegarde corrompue".to_string())?;
+    let plain = Zeroizing::new(crypto::decrypt_aes_gcm(&s.key, &nonce, &ct)?);
+    let db: Database = serde_json::from_slice(&plain).map_err(|_| "Sauvegarde corrompue".to_string())?;
+    // La sauvegarde source est déjà en mémoire : la rotation ne peut plus la perdre.
+    do_backup_in(&s.vault_path.to_string_lossy(), backup_dir)?;
+    atomic_write(&s.vault_path, &raw)?;
+    s.db = db;
+    s.editors.clear();
+    s.imports.clear();
+    s.has_decoy = vf.decoy_ciphertext.is_some();
     Ok(())
 }
 
@@ -304,12 +385,14 @@ fn decoy_database() -> Database {
     let mk = |profile_id: String, title: &str, content: &str, days: i64, wallpaper: &str| Note {
         id: Uuid::new_v4().to_string(),
         profile_id,
+        revision: 0,
         title: title.into(),
         content: content.into(),
         is_locked: false,
         locked_nonce: None,
         locked_payload: None,
         locked_salt: None,
+        locked_format: 0,
         created_at: now - Duration::days(days),
         modified_history: vec![],
         attachment_name: None,
@@ -330,11 +413,15 @@ fn decoy_database() -> Database {
             mk(p2.id.clone(), "Codes wifi", "Bureau : invité-2026\nImprimante : 192.168.1.20", 60, "carbon"),
         ],
         daily_goal_words: 0,
+        daily_word_counts: Some(HashMap::new()),
+        drafts: vec![],
+        smart_folders: vec![],
     }
 }
 
 #[tauri::command]
 fn set_decoy(decoy_password: String, state: State<AppState>) -> Result<(), String> {
+    let decoy_password = Zeroizing::new(decoy_password);
     if decoy_password.chars().count() < 8 {
         return Err("Mot de passe leurre trop court (min 8)".into());
     }
@@ -342,16 +429,16 @@ fn set_decoy(decoy_password: String, state: State<AppState>) -> Result<(), Strin
     let s = active(&mut guard)?;
     if s.decoy { return Err("Action impossible dans ce coffre".into()); }
     let db = decoy_database();
-    let json = serde_json::to_vec(&db).map_err(|e| e.to_string())?;
+    let json = Zeroizing::new(serde_json::to_vec(&db).map_err(|e| e.to_string())?);
     let salt = crypto::generate_salt();
-    let key = crypto::derive_key(&decoy_password, &salt)?;
+    let key = Zeroizing::new(crypto::derive_key(&decoy_password, &salt)?);
     let (nonce, ct) = crypto::encrypt_aes_gcm(&key, &json)?;
     let raw = fs::read_to_string(&s.vault_path).map_err(|e| e.to_string())?;
     let mut vf: VaultFile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     vf.decoy_salt = Some(B64.encode(salt));
     vf.decoy_nonce = Some(B64.encode(nonce));
     vf.decoy_ciphertext = Some(B64.encode(ct));
-    fs::write(&s.vault_path, serde_json::to_string_pretty(&vf).unwrap()).map_err(|e| e.to_string())?;
+    atomic_write(&s.vault_path, &serde_json::to_vec_pretty(&vf).map_err(|e| e.to_string())?)?;
     s.has_decoy = true;
     Ok(())
 }
@@ -366,7 +453,7 @@ fn remove_decoy(state: State<AppState>) -> Result<(), String> {
     vf.decoy_salt = None;
     vf.decoy_nonce = None;
     vf.decoy_ciphertext = None;
-    fs::write(&s.vault_path, serde_json::to_string_pretty(&vf).unwrap()).map_err(|e| e.to_string())?;
+    atomic_write(&s.vault_path, &serde_json::to_vec_pretty(&vf).map_err(|e| e.to_string())?)?;
     s.has_decoy = false;
     Ok(())
 }
@@ -400,9 +487,10 @@ fn create_profile(name: String, state: State<AppState>) -> Result<Profile, Strin
     let s = active(&mut guard)?;
     if name.trim().is_empty() { return Err("Nom de profil requis".into()); }
     let p = Profile { id: Uuid::new_v4().to_string(), name, created_at: Utc::now() };
-    s.db.profiles.push(p.clone());
-    save_session(s)?;
-    Ok(p)
+    mutate_database(s, |db| {
+        db.profiles.push(p.clone());
+        Ok(p)
+    })
 }
 
 #[tauri::command]
@@ -416,19 +504,52 @@ fn list_profiles(state: State<AppState>) -> Result<Vec<Profile>, String> {
 fn delete_profile(id: String, state: State<AppState>) -> Result<(), String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    s.db.profiles.retain(|p| p.id != id);
-    // Les notes du profil partent à la corbeille (récupérables), pas de destruction directe.
-    let now = Utc::now();
-    for n in s.db.notes.iter_mut().filter(|n| n.profile_id == id) {
-        if n.trashed_at.is_none() { n.trashed_at = Some(now); }
-    }
-    save_session(s)?;
-    Ok(())
+    mutate_database(s, |db| {
+        db.profiles.retain(|p| p.id != id);
+        // Les notes du profil partent à la corbeille (récupérables), pas de destruction directe.
+        let now = Utc::now();
+        for n in db.notes.iter_mut().filter(|n| n.profile_id == id) {
+            if n.trashed_at.is_none() { n.trashed_at = Some(now); }
+        }
+        Ok(())
+    })
 }
 
 // ---------- NOTES ----------
 
 #[tauri::command]
+fn open_note_editor(params: editor::OpenEditorParams, state: State<AppState>) -> Result<editor::EditorView, String> {
+    let mut guard = state.0.lock().unwrap();
+    editor::open(active(&mut guard)?, params)
+}
+
+#[tauri::command]
+fn save_note_editor(params: editor::SaveEditorParams, state: State<AppState>) -> Result<editor::SaveEditorResult, String> {
+    let mut guard = state.0.lock().unwrap();
+    editor::save(active(&mut guard)?, params)
+}
+
+#[tauri::command]
+fn close_note_editor(token: String, state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.0.lock().unwrap();
+    active(&mut guard)?.editors.remove(&token);
+    Ok(())
+}
+
+#[tauri::command]
+fn list_note_drafts(state: State<AppState>) -> Result<Vec<editor::DraftInfo>, String> {
+    let mut guard = state.0.lock().unwrap();
+    Ok(editor::list_drafts(active(&mut guard)?))
+}
+
+#[tauri::command]
+fn discard_note_draft(id: String, state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.0.lock().unwrap();
+    editor::discard_draft(active(&mut guard)?, &id)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // Arguments nommés du contrat IPC Tauri.
 fn create_note(
     profile_id: String,
     title: String,
@@ -446,15 +567,18 @@ fn create_note(
     if !s.db.profiles.iter().any(|p| p.id == profile_id) {
         return Err("Profil introuvable".into());
     }
+    validate_attachment(&attachment_name, &attachment_data)?;
     let mut note = Note {
         id: Uuid::new_v4().to_string(),
         profile_id,
+        revision: 0,
         title,
         content: content.clone(),
         is_locked: false,
         locked_nonce: None,
         locked_payload: None,
         locked_salt: None,
+        locked_format: 0,
         created_at: Utc::now(),
         modified_history: vec![],
         attachment_name,
@@ -471,29 +595,27 @@ fn create_note(
         if !pw.is_empty() {
             if pw.chars().count() < 4 { return Err("Mot de passe de note trop court (min 4)".into()); }
             let salt = crypto::generate_salt();
-            let nkey = crypto::derive_key(&pw, &salt)?;
-            let (nonce, ct) = crypto::encrypt_aes_gcm(&nkey, content.as_bytes())?;
-            note.content = String::new();
-            note.is_locked = true;
-            note.tags.clear(); // les tags en clair fuiraient les sujets : supprimés si verrouillée
-            note.locked_nonce = Some(B64.encode(nonce));
-            note.locked_payload = Some(B64.encode(ct));
-            note.locked_salt = Some(B64.encode(salt));
+            let pw = Zeroizing::new(pw);
+            let nkey = Zeroizing::new(crypto::derive_key(&pw, &salt)?);
+            protect_note(&mut note, &nkey, &salt)?;
         }
     }
-    s.db.notes.push(note.clone());
-    save_session(s)?;
-    Ok(note)
+    mutate_database(s, |db| {
+        record_words(db, if note.is_locked { 0 } else { note.content.split_whitespace().count() });
+        db.notes.push(note.clone());
+        Ok(note.for_client())
+    })
 }
 
 #[tauri::command]
 fn list_notes(profile_id: String, state: State<AppState>) -> Result<Vec<Note>, String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    Ok(s.db.notes.iter().filter(|n| n.profile_id == profile_id && n.trashed_at.is_none()).cloned().collect())
+    Ok(s.db.notes.iter().filter(|n| n.profile_id == profile_id && n.trashed_at.is_none()).map(Note::for_client).collect())
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Arguments nommés du contrat IPC Tauri.
 fn update_note(
     id: String,
     title: String,
@@ -501,39 +623,82 @@ fn update_note(
     wallpaper: String,
     glass: bool,
     tags: Vec<String>,
+    attachment_name: Option<String>,
+    attachment_data: Option<String>,
+    remove_attachment: Option<bool>,
     state: State<AppState>,
 ) -> Result<Note, String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    let n = s.db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
-    if n.is_locked { return Err("Note verrouillée : déchiffrez-la d'abord".into()); }
-    if n.trashed_at.is_some() { return Err("Note dans la corbeille : restaurez-la d'abord".into()); }
-    // Snapshot du contenu précédent (plafond 20 versions)
-    let now = Utc::now();
-    n.versions.push(NoteVersion { title: n.title.clone(), content: n.content.clone(), saved_at: now });
-    if n.versions.len() > 20 { let drop = n.versions.len() - 20; n.versions.drain(0..drop); }
-    n.title = title;
-    n.content = content.clone();
-    n.wallpaper = wallpaper;
-    n.glass = glass;
-    n.tags = normalize_tags(tags);
-    // Les surlignages hors-limites après édition sont nettoyés
-    let len = content.chars().count();
-    n.highlights.retain(|h| h.start < len && h.end <= len && h.start < h.end);
-    n.modified_history.push(Utc::now());
-    let out = n.clone();
-    save_session(s)?;
-    Ok(out)
+    mutate_database(s, |db| {
+        record_words(db, 0);
+        let n = db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
+        if n.is_locked { return Err("Note verrouillée : déchiffrez-la d'abord".into()); }
+        if n.trashed_at.is_some() { return Err("Note dans la corbeille : restaurez-la d'abord".into()); }
+        let added_words = content.split_whitespace().count().saturating_sub(n.content.split_whitespace().count());
+        apply_attachment(n, attachment_name, attachment_data, remove_attachment.unwrap_or(false))?;
+        // Snapshot du contenu précédent (plafond 20 versions)
+        let now = Utc::now();
+        n.versions.push(NoteVersion { title: n.title.clone(), content: n.content.clone(), saved_at: now });
+        if n.versions.len() > 20 { let drop = n.versions.len() - 20; n.versions.drain(0..drop); }
+        n.title = title;
+        n.content = content.clone();
+        n.wallpaper = wallpaper;
+        n.glass = glass;
+        n.tags = normalize_tags(tags);
+        // Les surlignages hors-limites après édition sont nettoyés
+        let len = content.chars().count();
+        n.highlights.retain(|h| h.start < len && h.end <= len && h.start < h.end);
+        n.modified_history.push(now);
+        n.revision = n.revision.saturating_add(1);
+        let out = n.clone();
+        record_words(db, added_words);
+        Ok(out)
+    })
+}
+
+fn validate_attachment(name: &Option<String>, data: &Option<String>) -> Result<(), String> {
+    match (name, data) {
+        (None, None) => Ok(()),
+        (Some(name), Some(data)) if !name.trim().is_empty() => {
+            B64.decode(data).map_err(|_| "Pièce jointe invalide".to_string())?;
+            Ok(())
+        }
+        _ => Err("Nom et contenu de pièce jointe requis ensemble".into()),
+    }
+}
+
+fn apply_attachment(note: &mut Note, name: Option<String>, data: Option<String>, remove: bool) -> Result<(), String> {
+    validate_attachment(&name, &data)?;
+    if remove && name.is_some() { return Err("Choisissez le remplacement ou la suppression de la pièce jointe".into()); }
+    if remove || name.is_some() {
+        note.attachment_name = name;
+        note.attachment_data = data;
+    }
+    Ok(())
+}
+
+fn record_words(db: &mut Database, added: usize) {
+    let today = Utc::now().date_naive();
+    if db.daily_word_counts.is_none() {
+        let baseline = db.notes.iter().filter(|n| !n.is_locked && n.trashed_at.is_none() && n.created_at.date_naive() == today)
+            .map(|n| n.content.split_whitespace().count()).sum();
+        db.daily_word_counts = Some(HashMap::from([(today.to_string(), baseline)]));
+    }
+    let count = db.daily_word_counts.as_mut().unwrap().entry(today.to_string()).or_default();
+    *count = count.saturating_add(added);
 }
 
 #[tauri::command]
 fn delete_note(id: String, state: State<AppState>) -> Result<(), String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    let n = s.db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
-    n.trashed_at = Some(Utc::now()); // soft-delete, récupérable
-    save_session(s)?;
-    Ok(())
+    mutate_database(s, |db| {
+        let n = db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
+        n.trashed_at = Some(Utc::now()); // soft-delete, récupérable
+        n.revision = n.revision.saturating_add(1);
+        Ok(())
+    })
 }
 
 // ---------- TAGS ----------
@@ -542,13 +707,15 @@ fn delete_note(id: String, state: State<AppState>) -> Result<(), String> {
 fn set_tags(id: String, tags: Vec<String>, state: State<AppState>) -> Result<Note, String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    let n = s.db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
-    if n.is_locked { return Err("Note verrouillée : tags impossibles".into()); }
-    if n.trashed_at.is_some() { return Err("Note dans la corbeille : restaurez-la d'abord".into()); }
-    n.tags = normalize_tags(tags);
-    let out = n.clone();
-    save_session(s)?;
-    Ok(out)
+    mutate_database(s, |db| {
+        let n = db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
+        if n.is_locked { return Err("Note verrouillée : tags impossibles".into()); }
+        if n.trashed_at.is_some() { return Err("Note dans la corbeille : restaurez-la d'abord".into()); }
+        n.tags = normalize_tags(tags);
+        n.revision = n.revision.saturating_add(1);
+        let out = n.clone();
+        Ok(out)
+    })
 }
 
 #[tauri::command]
@@ -570,27 +737,7 @@ fn list_tags(state: State<AppState>) -> Result<Vec<(String, usize)>, String> {
 
 /// Extrait les références [[Nom]] d'un texte (sans crate regex).
 fn extract_links(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = vec![];
-    let mut i = 0;
-    while i + 1 < chars.len() {
-        if chars[i] == '[' && chars[i + 1] == '[' {
-            let rest = &chars[i + 2..];
-            if let Some(end) = rest.windows(2).position(|w| w == [']', ']']) {
-                let name: String = rest[..end].iter().collect();
-                let name = name.trim();
-                if !name.is_empty() && name.chars().count() <= 80 {
-                    out.push(name.to_string());
-                }
-                i += 2 + end + 2;
-                continue;
-            } else {
-                break;
-            }
-        }
-        i += 1;
-    }
-    out
+    links::references(text).into_iter().map(|r| r.target).collect()
 }
 
 /// Extrait les personnes @nom d'un texte (100% local, sans regex).
@@ -609,7 +756,7 @@ fn extract_persons(text: &str) -> Vec<String> {
             let raw: String = chars[i + 1..j].iter().collect();
             let name = raw.trim_matches(|c| c == '.' || c == '-' || c == '_').to_lowercase();
             let len = name.chars().count();
-            if len >= 2 && len <= 24 && !out.contains(&name) {
+            if (2..=24).contains(&len) && !out.contains(&name) {
                 out.push(name);
             }
             i = if j == i + 1 { i + 1 } else { j };
@@ -633,7 +780,7 @@ fn is_name_char(c: char) -> bool {
 fn clean_name(raw: &str) -> Option<String> {
     let name = raw.trim_matches(|c| c == '.' || c == '-' || c == '_').to_lowercase();
     let len = name.chars().count();
-    if len >= 2 && len <= 24 {
+    if (2..=24).contains(&len) {
         Some(name)
     } else {
         None
@@ -683,8 +830,7 @@ fn extract_places(text: &str) -> Vec<String> {
                 let raw: String = chars[i + 1..j].iter().collect();
                 let low = raw.to_lowercase();
                 for prefix in ["lieux/", "lieu/", "places/", "place/"] {
-                    if low.starts_with(prefix) {
-                        let suffix = &low[prefix.len()..];
+                    if let Some(suffix) = low.strip_prefix(prefix) {
                         if let Some(n) = clean_name(suffix) {
                             push(n);
                         }
@@ -743,8 +889,7 @@ fn extract_ideas(text: &str) -> Vec<String> {
                 let raw: String = chars[i + 1..j].iter().collect();
                 let low = raw.to_lowercase();
                 for prefix in ["idée/", "idee/", "ideas/", "idea/"] {
-                    if low.starts_with(prefix) {
-                        let suffix = &low[prefix.len()..];
+                    if let Some(suffix) = low.strip_prefix(prefix) {
                         if let Some(n) = clean_name(suffix) {
                             push(n);
                         }
@@ -761,17 +906,7 @@ fn extract_ideas(text: &str) -> Vec<String> {
 }
 
 fn valid_ymd(y: u32, m: u32, d: u32) -> bool {
-    if y < 1900 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31 {
-        return false;
-    }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let max = match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => if leap { 29 } else { 28 },
-        _ => 0,
-    };
-    d <= max
+    (1900..=2100).contains(&y) && chrono::NaiveDate::from_ymd_opt(y as i32, m, d).is_some()
 }
 
 /// Extrait les dates explicites d'un texte, normalisées en "YYYY-MM-DD".
@@ -838,21 +973,14 @@ fn get_graph(state: State<AppState>) -> Result<Graph, String> {
         .collect();
     let pname = |pid: &str| s.db.profiles.iter()
         .find(|p| p.id == pid).map(|p| p.name.clone()).unwrap_or_else(|| "profil supprimé".into());
-    let mut by_title: HashMap<String, &str> = HashMap::new();
-    let mut by_id: HashMap<&str, &str> = HashMap::new();
-    for n in &live {
-        by_title.entry(n.title.to_lowercase()).or_insert(n.id.as_str());
-        by_id.insert(n.id.as_str(), n.id.as_str());
-    }
+    let link_index = links::Index::new(&s.db);
     // --- Couche 1 : liens note -> note via [[...]] ---
     let mut edge_set: HashSet<(String, String, String)> = HashSet::new();
     for n in &live {
         for r in extract_links(&n.content) {
-            let key = r.to_lowercase();
-            let target = by_title.get(&key).or_else(|| by_id.get(r.as_str()).map(|x| x));
-            if let Some(t) = target {
-                if *t != n.id.as_str() {
-                    edge_set.insert((n.id.clone(), (*t).to_string(), "link".to_string()));
+            if let links::Resolution::Resolved(target) = link_index.resolve(&r) {
+                if target.id != n.id {
+                    edge_set.insert((n.id.clone(), target.id.clone(), "link".to_string()));
                 }
             }
         }
@@ -1006,9 +1134,10 @@ fn set_daily_goal(words: usize, state: State<AppState>) -> Result<usize, String>
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
     let w = words.clamp(0, 10000);
-    s.db.daily_goal_words = w;
-    save_session(s)?;
-    Ok(w)
+    mutate_database(s, |db| {
+        db.daily_goal_words = w;
+        Ok(w)
+    })
 }
 
 // ---------- CORBEILLE & VERSIONS ----------
@@ -1017,17 +1146,33 @@ fn set_daily_goal(words: usize, state: State<AppState>) -> Result<usize, String>
 fn list_trash(state: State<AppState>) -> Result<Vec<Note>, String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    Ok(s.db.notes.iter().filter(|n| n.trashed_at.is_some()).cloned().collect())
+    Ok(s.db.notes.iter().filter(|n| n.trashed_at.is_some()).map(Note::for_client).collect())
 }
 
 #[tauri::command]
 fn restore_note(id: String, state: State<AppState>) -> Result<Note, String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    let n = s.db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
+    mutate_database(s, |db| restore_trashed_note(db, &id))
+}
+
+fn restore_trashed_note(db: &mut Database, id: &str) -> Result<Note, String> {
+    let index = db.notes.iter().position(|n| n.id == id).ok_or("Note introuvable")?;
+    if !db.profiles.iter().any(|p| p.id == db.notes[index].profile_id) {
+        let profile_id = if let Some(profile) = db.profiles.iter().find(|p| p.name == "Notes restaurées") {
+            profile.id.clone()
+        } else {
+            let profile = Profile { id: Uuid::new_v4().to_string(), name: "Notes restaurées".into(), created_at: Utc::now() };
+            let id = profile.id.clone();
+            db.profiles.push(profile);
+            id
+        };
+        db.notes[index].profile_id = profile_id;
+    }
+    let n = &mut db.notes[index];
     n.trashed_at = None;
-    let out = n.clone();
-    save_session(s)?;
+    n.revision = n.revision.saturating_add(1);
+    let out = n.for_client();
     Ok(out)
 }
 
@@ -1035,59 +1180,115 @@ fn restore_note(id: String, state: State<AppState>) -> Result<Note, String> {
 fn purge_note(id: String, state: State<AppState>) -> Result<(), String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    let pos = s.db.notes.iter().position(|n| n.id == id).ok_or("Note introuvable")?;
-    if s.db.notes[pos].trashed_at.is_none() {
-        return Err("Destruction définitive refusée : mettez d'abord la note à la corbeille".into());
-    }
-    s.db.notes.remove(pos);
-    save_session(s)?;
-    Ok(())
+    mutate_database(s, |db| {
+        let pos = db.notes.iter().position(|n| n.id == id).ok_or("Note introuvable")?;
+        if db.notes[pos].trashed_at.is_none() {
+            return Err("Destruction définitive refusée : mettez d'abord la note à la corbeille".into());
+        }
+        db.notes.remove(pos);
+        Ok(())
+    })
 }
 
 #[tauri::command]
 fn empty_trash(state: State<AppState>) -> Result<usize, String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    let before = s.db.notes.len();
-    s.db.notes.retain(|n| n.trashed_at.is_none());
-    save_session(s)?;
-    Ok(before - s.db.notes.len())
+    mutate_database(s, |db| {
+        let before = db.notes.len();
+        db.notes.retain(|n| n.trashed_at.is_none());
+        Ok(before - db.notes.len())
+    })
 }
 
 #[tauri::command]
 fn restore_version(id: String, index: usize, state: State<AppState>) -> Result<Note, String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    let n = s.db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
-    if n.is_locked { return Err("Note verrouillée : restauration impossible".into()); }
-    if n.trashed_at.is_some() { return Err("Note dans la corbeille : restaurez-la d'abord".into()); }
-    if index >= n.versions.len() { return Err("Version introuvable".into()); }
+    mutate_database(s, |db| {
+        let n = db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
+        if n.is_locked { return Err("Note verrouillée : restauration impossible".into()); }
+        if n.trashed_at.is_some() { return Err("Note dans la corbeille : restaurez-la d'abord".into()); }
+        restore_note_version(n, index)?;
+        Ok(n.for_client())
+    })
+}
+
+fn restore_note_version(n: &mut Note, index: usize) -> Result<(), String> {
+    let v = n.versions.get(index).ok_or("Version introuvable")?.clone();
     let now = Utc::now();
     n.versions.push(NoteVersion { title: n.title.clone(), content: n.content.clone(), saved_at: now });
     if n.versions.len() > 20 { let drop = n.versions.len() - 20; n.versions.drain(0..drop); }
-    let v = n.versions[index].clone();
     n.title = v.title;
     n.content = v.content;
     let len = n.content.chars().count();
     n.highlights.retain(|h| h.start < len && h.end <= len && h.start < h.end);
     n.modified_history.push(now);
-    let out = n.clone();
-    save_session(s)?;
-    Ok(out)
+    n.revision = n.revision.saturating_add(1);
+    Ok(())
 }
 
 #[tauri::command]
-fn unlock_note_content(id: String, password: String, state: State<AppState>) -> Result<String, String> {
+fn unlock_note_content(id: String, password: String, state: State<AppState>) -> Result<ProtectedNote, String> {
+    let password = Zeroizing::new(password);
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
+    decrypt_note(s, &id, &password)
+}
+
+fn protect_note(note: &mut Note, key: &[u8; 32], salt: &[u8]) -> Result<(), String> {
+    let payload = note_payload(note);
+    let json = Zeroizing::new(serde_json::to_vec(&payload).map_err(|e| e.to_string())?);
+    let (nonce, ct) = crypto::encrypt_aes_gcm(key, &json)?;
+    note.title.zeroize();
+    note.content.zeroize();
+    if let Some(data) = &mut note.attachment_data { data.zeroize(); }
+    note.attachment_name = None;
+    note.attachment_data = None;
+    note.is_locked = true;
+    note.tags.clear();
+    note.versions.clear();
+    note.highlights.clear();
+    note.locked_format = 2;
+    note.locked_nonce = Some(B64.encode(nonce));
+    note.locked_payload = Some(B64.encode(ct));
+    note.locked_salt = Some(B64.encode(salt));
+    Ok(())
+}
+
+fn decrypt_note(s: &mut Session, id: &str, password: &str) -> Result<ProtectedNote, String> {
     let n = s.db.notes.iter().find(|n| n.id == id).ok_or("Note introuvable")?;
-    if !n.is_locked { return Ok(n.content.clone()); }
+    if !n.is_locked { return Ok(note_payload(n)); }
     let salt = B64.decode(n.locked_salt.as_ref().ok_or("Note corrompue")?).map_err(|e| e.to_string())?;
+    let nkey = Zeroizing::new(crypto::derive_key(password, &salt)?);
+    let payload = decrypt_note_with_key(n, &nkey)?;
+    if n.locked_format == 0 {
+        mutate_database(s, |db| {
+            let note = db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
+            note.content = payload.content.clone();
+            protect_note(note, &nkey, &salt)
+        })?;
+    }
+    Ok(payload)
+}
+
+fn note_payload(n: &Note) -> ProtectedNote {
+    ProtectedNote { title: n.title.clone(), content: n.content.clone(), attachment_name: n.attachment_name.clone(), attachment_data: n.attachment_data.clone(), tags: n.tags.clone(), versions: n.versions.clone(), highlights: n.highlights.clone() }
+}
+
+fn decrypt_note_with_key(n: &Note, key: &[u8; 32]) -> Result<ProtectedNote, String> {
     let nonce = B64.decode(n.locked_nonce.as_ref().ok_or("Note corrompue")?).map_err(|e| e.to_string())?;
     let ct = B64.decode(n.locked_payload.as_ref().ok_or("Note corrompue")?).map_err(|e| e.to_string())?;
-    let nkey = crypto::derive_key(&password, &salt)?;
-    let plain = crypto::decrypt_aes_gcm(&nkey, &nonce, &ct)?;
-    String::from_utf8(plain).map_err(|e| e.to_string())
+    let plain = Zeroizing::new(crypto::decrypt_aes_gcm(key, &nonce, &ct)?);
+    match n.locked_format {
+        1 | 2 => serde_json::from_slice(&plain).map_err(|_| "Note corrompue".to_string()),
+        0 => {
+            let mut payload = note_payload(n);
+            payload.content = String::from_utf8(plain.to_vec()).map_err(|e| e.to_string())?;
+            Ok(payload)
+        }
+        _ => Err("Format de note non pris en charge".into()),
+    }
 }
 
 #[tauri::command]
@@ -1096,30 +1297,37 @@ fn add_highlight(id: String, start: usize, end: usize, color: String, state: Sta
     if !allowed.contains(&color.as_str()) { return Err("Couleur invalide".into()); }
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    let n = s.db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
-    if n.is_locked { return Err("Note verrouillée : surlignage impossible".into()); }
-    let len = n.content.chars().count();
-    if start >= end || end > len { return Err("Sélection invalide".into()); }
-    let h = Highlight { id: Uuid::new_v4().to_string(), start, end, color };
-    n.highlights.push(h);
-    // fusion simple : tri par start pour un rendu stable
-    n.highlights.sort_by_key(|h| h.start);
-    let out = n.clone();
-    save_session(s)?;
-    Ok(out)
+    mutate_database(s, |db| {
+        let n = db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
+        if n.is_locked { return Err("Note verrouillée : surlignage impossible".into()); }
+        if n.trashed_at.is_some() { return Err("Note dans la corbeille : restaurez-la d'abord".into()); }
+        let len = n.content.chars().count();
+        if start >= end || end > len { return Err("Sélection invalide".into()); }
+        let h = Highlight { id: Uuid::new_v4().to_string(), start, end, color };
+        n.highlights.push(h);
+        // fusion simple : tri par start pour un rendu stable
+        n.highlights.sort_by_key(|h| h.start);
+        n.revision = n.revision.saturating_add(1);
+        let out = n.clone();
+        Ok(out)
+    })
 }
 
 #[tauri::command]
 fn remove_highlight(id: String, highlight_id: String, state: State<AppState>) -> Result<Note, String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    let n = s.db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
-    let before = n.highlights.len();
-    n.highlights.retain(|h| h.id != highlight_id);
-    if n.highlights.len() == before { return Err("Surlignage introuvable".into()); }
-    let out = n.clone();
-    save_session(s)?;
-    Ok(out)
+    mutate_database(s, |db| {
+        let n = db.notes.iter_mut().find(|n| n.id == id).ok_or("Note introuvable")?;
+        if n.is_locked { return Err("Note verrouillée : surlignage impossible".into()); }
+        if n.trashed_at.is_some() { return Err("Note dans la corbeille : restaurez-la d'abord".into()); }
+        let before = n.highlights.len();
+        n.highlights.retain(|h| h.id != highlight_id);
+        if n.highlights.len() == before { return Err("Surlignage introuvable".into()); }
+        n.revision = n.revision.saturating_add(1);
+        let out = n.clone();
+        Ok(out)
+    })
 }
 
 #[tauri::command]
@@ -1168,17 +1376,7 @@ fn get_stats(state: State<AppState>) -> Result<Stats, String> {
     }).collect();
 
     // Activité journalière (créations + modifications)
-    let mut crea: HashMap<chrono::NaiveDate, usize> = HashMap::new();
-    let mut modi: HashMap<chrono::NaiveDate, usize> = HashMap::new();
-    for n in &live {
-        *crea.entry(n.created_at.date_naive()).or_insert(0) += 1;
-        for m in &n.modified_history {
-            *modi.entry(m.date_naive()).or_insert(0) += 1;
-        }
-        for v in &n.versions {
-            *modi.entry(v.saved_at.date_naive()).or_insert(0) += 1;
-        }
-    }
+    let (crea, modi) = daily_activity(&live);
     let today = Utc::now().date_naive();
     let day_label = |d: chrono::NaiveDate| d.format("%d/%m").to_string();
     let last_30d: Vec<DayStat> = (0..30).rev().map(|i| {
@@ -1219,11 +1417,11 @@ fn get_stats(state: State<AppState>) -> Result<Stats, String> {
     let mut streak_current = 0;
     let mut d = today;
     if !active_days.contains(&d) {
-        d = d - Duration::days(1);
+        d -= Duration::days(1);
     }
     while active_days.contains(&d) {
         streak_current += 1;
-        d = d - Duration::days(1);
+        d -= Duration::days(1);
     }
     let mut sorted: Vec<_> = active_days.into_iter().collect();
     sorted.sort();
@@ -1239,10 +1437,10 @@ fn get_stats(state: State<AppState>) -> Result<Stats, String> {
         streak_best = streak_best.max(run);
         prev = Some(day);
     }
-    let words_today: usize = live.iter()
+    let words_today: usize = s.db.daily_word_counts.as_ref().map(|counts| counts.get(&today.to_string()).copied().unwrap_or(0)).unwrap_or_else(|| live.iter()
         .filter(|n| !n.is_locked && n.created_at.date_naive() == today)
         .map(|n| words(&n.content))
-        .sum();
+        .sum());
 
     // Top tags (notes verrouillées exclues : tags supprimés de toute façon)
     let mut tag_counts: HashMap<String, usize> = HashMap::new();
@@ -1293,48 +1491,450 @@ fn get_stats(state: State<AppState>) -> Result<Stats, String> {
     })
 }
 
+type DayCounts = HashMap<chrono::NaiveDate, usize>;
+
+fn daily_activity(notes: &[&Note]) -> (DayCounts, DayCounts) {
+    let mut creations = HashMap::new();
+    let mut modifications = HashMap::new();
+    for n in notes {
+        *creations.entry(n.created_at.date_naive()).or_insert(0) += 1;
+        // Les versions sont des snapshots de ces mêmes modifications, pas d'autres événements.
+        for date in &n.modified_history {
+            *modifications.entry(date.date_naive()).or_insert(0) += 1;
+        }
+    }
+    (creations, modifications)
+}
+
+#[tauri::command]
+fn search_command_items(query: String, state: State<AppState>) -> Result<commands::CommandMatches, String> {
+    let mut guard = state.0.lock().unwrap();
+    Ok(commands::search(&active(&mut guard)?.db, &query))
+}
+
+#[tauri::command]
+fn get_note(id: String, state: State<AppState>) -> Result<Note, String> {
+    let mut guard = state.0.lock().unwrap();
+    let session = active(&mut guard)?;
+    session.db.notes.iter().find(|n| n.id == id && n.trashed_at.is_none())
+        .map(Note::for_client).ok_or_else(|| "Note introuvable".into())
+}
+
 #[tauri::command]
 fn search_notes(params: SearchParams, state: State<AppState>) -> Result<Vec<Note>, String> {
     let mut guard = state.0.lock().unwrap();
     let s = active(&mut guard)?;
-    let q = params.query.unwrap_or_default().to_lowercase();
-    Ok(s.db.notes.iter().filter(|n| {
-        if n.trashed_at.is_some() { return false; }
-        if let Some(pid) = &params.profile_id {
-            if !pid.is_empty() && &n.profile_id != pid { return false; }
-        }
-        if let Some(tag) = params.tag.as_ref().filter(|t| !t.is_empty()) {
-            if !n.tags.iter().any(|t| t == tag) { return false; }
-        }
-        if let Some(from) = params.date_from {
-            if n.created_at < from { return false; }
-        }
-        if let Some(to) = params.date_to {
-            if n.created_at > to { return false; }
-        }
-        if !q.is_empty() {
-            // Notes verrouillées : titre masqué + contenu chiffré → non cherchables par mot-clé.
-            if n.is_locked { return false; }
-            let hay = format!("{} {}", n.title, n.content).to_lowercase();
-            if !hay.contains(&q) { return false; }
-        }
-        true
-    }).cloned().collect())
+    let filter = search::CompiledSearch::new(&params, Utc::now())?;
+    Ok(s.db.notes.iter().filter(|n| filter.matches(n, &s.db.profiles)).map(Note::for_client).collect())
+}
+
+#[cfg(test)]
+fn note_matches_search(n: &Note, params: &SearchParams, q: &str) -> bool {
+    let params = SearchParams { query: Some(q.into()), ..params.clone() };
+    search::CompiledSearch::new(&params, Utc::now()).unwrap().matches(n, &[])
+}
+
+#[tauri::command]
+fn list_smart_folders(state: State<AppState>) -> Result<Vec<search::FolderSummary>, String> {
+    let mut guard = state.0.lock().unwrap();
+    Ok(search::list_folders(&active(&mut guard)?.db, Utc::now()))
+}
+
+#[tauri::command]
+fn save_smart_folder(id: Option<String>, name: String, params: SearchParams, state: State<AppState>) -> Result<SmartFolder, String> {
+    let mut guard = state.0.lock().unwrap();
+    mutate_database(active(&mut guard)?, |db| search::save_folder(db, id, name, params, Utc::now()))
+}
+
+#[tauri::command]
+fn delete_smart_folder(id: String, state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.0.lock().unwrap();
+    mutate_database(active(&mut guard)?, |db| { db.smart_folders.retain(|f| f.id != id); Ok(()) })
+}
+
+#[tauri::command]
+fn run_smart_folder(id: String, state: State<AppState>) -> Result<search::FolderResults, String> {
+    let mut guard = state.0.lock().unwrap();
+    let s = active(&mut guard)?;
+    let folder = s.db.smart_folders.iter().find(|f| f.id == id).ok_or("Dossier introuvable")?.clone();
+    let filter = search::CompiledSearch::new(&folder.params, Utc::now())?;
+    let notes = s.db.notes.iter().filter(|n| filter.matches(n, &s.db.profiles)).map(Note::for_client).collect();
+    Ok(search::FolderResults { folder, notes })
+}
+
+#[tauri::command]
+fn get_note_context(id: String, state: State<AppState>) -> Result<links::NoteContext, String> {
+    let mut guard = state.0.lock().unwrap();
+    links::context(&active(&mut guard)?.db, &id)
+}
+
+#[tauri::command]
+fn resolve_note_reference(reference: String, state: State<AppState>) -> Result<links::ResolvedReference, String> {
+    let mut guard = state.0.lock().unwrap();
+    links::resolve(&active(&mut guard)?.db, &reference)
+}
+
+#[tauri::command]
+fn create_note_from_reference(source_id: String, reference: String, state: State<AppState>) -> Result<String, String> {
+    let mut guard = state.0.lock().unwrap();
+    links::create_target(active(&mut guard)?, &source_id, &reference)
+}
+
+#[tauri::command]
+fn list_transfer_notes(state: State<AppState>) -> Result<Vec<transfer::TransferNote>, String> {
+    let mut guard = state.0.lock().unwrap();
+    Ok(transfer::list_notes(&active(&mut guard)?.db))
+}
+
+#[tauri::command]
+fn export_notes(ids: Vec<String>, format: String, password: Option<String>, state: State<AppState>) -> Result<transfer::Artifact, String> {
+    let mut guard = state.0.lock().unwrap();
+    transfer::export(&active(&mut guard)?.db, &ids, &format, password)
+}
+
+#[tauri::command]
+fn prepare_note_import(files: Vec<transfer::InputFile>, password: Option<String>, state: State<AppState>) -> Result<transfer::Preview, String> {
+    let mut guard = state.0.lock().unwrap();
+    transfer::prepare(active(&mut guard)?, files, password)
+}
+
+#[tauri::command]
+async fn choose_directory_import(app: tauri::AppHandle, title: Option<String>) -> Result<Option<transfer::Preview>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let session_id = {
+        let state = app.state::<AppState>(); let mut guard = state.0.lock().unwrap();
+        active(&mut guard)?.id.clone()
+    };
+    let (send, receive) = std::sync::mpsc::channel();
+    let window = app.get_webview_window("main").ok_or("Fenêtre principale introuvable")?;
+    app.dialog().file().set_parent(&window).set_title(title.unwrap_or_else(|| "SecureNotes — Importer un dossier".into())).pick_folder(move |selected| { let _ = send.send(selected); });
+    let selected = tauri::async_runtime::spawn_blocking(move || receive.recv()).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let Some(selected) = selected else { return Ok(None); };
+    let path = selected.into_path().map_err(|e| e.to_string())?;
+    let name = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_else(|| "Import".into());
+    // La lecture du dossier ne retient ni le verrou ni la clé du coffre.
+    let plan = tauri::async_runtime::spawn_blocking(move || transfer::directory_plan(&path)).await.map_err(|e| e.to_string())??;
+    let state = app.state::<AppState>(); let mut guard = state.0.lock().unwrap();
+    let session = active(&mut guard)?;
+    Ok(Some(transfer::stage_directory(session, &session_id, plan, name)?))
+}
+
+#[tauri::command]
+fn commit_note_import(token: String, destination_profile_id: Option<String>, preserve_profiles: bool, copies: bool, state: State<AppState>) -> Result<transfer::ImportResult, String> {
+    let mut guard = state.0.lock().unwrap();
+    transfer::commit(active(&mut guard)?, &token, destination_profile_id, preserve_profiles, copies)
+}
+
+#[tauri::command]
+fn discard_note_import(token: String, state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.0.lock().unwrap();
+    active(&mut guard)?.imports.remove(&token); Ok(())
 }
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState(Mutex::new(AppInner { session: None, last_active: None, timeout_secs: DEFAULT_TIMEOUT_SECS })))
+        .setup(|app| {
+            let handle = app.handle().clone();
+            // L'expiration efface la clé même si l'interface est suspendue.
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let state = handle.state::<AppState>();
+                let expired = state.0.lock().map(|mut inner| expire_session(&mut inner)).unwrap_or(false);
+                if expired { let _ = handle.emit("vault-locked", ()); }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             create_vault, list_vaults, unlock_vault, lock_vault,
-            get_auto_lock_timeout, set_auto_lock_timeout,
+            get_auto_lock_timeout, set_auto_lock_timeout, touch_session,
             create_profile, list_profiles, delete_profile,
             create_note, list_notes, update_note, delete_note,
+            open_note_editor, save_note_editor, close_note_editor, list_note_drafts, discard_note_draft,
             list_trash, restore_note, purge_note, empty_trash, restore_version,
             set_tags, list_tags, get_graph, set_daily_goal,
             backup_now, list_backups, restore_backup, set_decoy, remove_decoy,
-            unlock_note_content, search_notes, get_stats, add_highlight, remove_highlight
+            unlock_note_content, search_notes, search_command_items, get_note, get_stats, add_highlight, remove_highlight,
+            list_smart_folders, save_smart_folder, delete_smart_folder, run_smart_folder,
+            get_note_context, resolve_note_reference, create_note_from_reference,
+            list_transfer_notes, export_notes, prepare_note_import, choose_directory_import, commit_note_import, discard_note_import
         ])
         .run(tauri::generate_context!())
         .expect("Erreur Tauri");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(super) struct Sandbox(pub(super) PathBuf);
+    impl Sandbox {
+        pub(super) fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("securenotes-test-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        pub(super) fn session(&self) -> Session {
+            let path = self.0.join("Perso.snotevault");
+            let key = [7; 32];
+            let db = Database::default();
+            let (nonce, ct) = crypto::encrypt_aes_gcm(&key, &serde_json::to_vec(&db).unwrap()).unwrap();
+            let vf = VaultFile { version: 1, name: "Perso".into(), salt: B64.encode([1; 16]), nonce: B64.encode(nonce), ciphertext: B64.encode(ct), decoy_salt: None, decoy_nonce: None, decoy_ciphertext: None };
+            atomic_write(&path, &serde_json::to_vec(&vf).unwrap()).unwrap();
+            Session { id: Uuid::new_v4().to_string(), key, vault_path: path, db, decoy: false, has_decoy: false, editors: HashMap::new(), imports: HashMap::new() }
+        }
+    }
+    impl Drop for Sandbox {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    pub(super) fn sample_note() -> Note {
+        serde_json::from_value(serde_json::json!({
+            "id": "n", "profile_id": "p", "title": "Titre secret", "content": "Contenu secret",
+            "attachment_name": "secret.txt", "attachment_data": "c2VjcmV0",
+            "is_locked": false, "locked_nonce": null, "locked_payload": null, "locked_salt": null,
+            "created_at": "2026-10-25T12:00:00Z", "modified_history": [], "wallpaper": "aurora", "glass": true
+        })).unwrap()
+    }
+
+    #[test]
+    fn protected_note_encrypts_title_content_and_attachment() {
+        let sandbox = Sandbox::new();
+        let mut s = sandbox.session();
+        let mut note = sample_note();
+        let salt = [3; 16];
+        let key = crypto::derive_key("note-password", &salt).unwrap();
+        protect_note(&mut note, &key, &salt).unwrap();
+        assert!(note.title.is_empty());
+        assert!(note.content.is_empty());
+        assert!(note.attachment_data.is_none());
+        assert!(note.attachment_name.is_none());
+        s.db.notes.push(note);
+        assert!(decrypt_note(&mut s, "n", "wrong-password").is_err());
+        let opened = decrypt_note(&mut s, "n", "note-password").unwrap();
+        assert_eq!(opened.title, "Titre secret");
+        assert_eq!(opened.content, "Contenu secret");
+        assert_eq!(opened.attachment_data.as_deref(), Some("c2VjcmV0"));
+    }
+
+    #[test]
+    fn restoring_at_version_limit_uses_the_requested_version() {
+        for index in [0, 9, 19] {
+            let mut note = sample_note();
+            note.versions = (0..20).map(|i| NoteVersion { title: format!("title-{i}"), content: format!("version-{i}"), saved_at: Utc::now() }).collect();
+            restore_note_version(&mut note, index).unwrap();
+            assert_eq!(note.content, format!("version-{index}"));
+            assert_eq!(note.versions.len(), 20);
+            assert_eq!(note.versions.last().unwrap().content, "Contenu secret");
+        }
+        let mut note = sample_note();
+        assert!(restore_note_version(&mut note, 0).is_err());
+        assert_eq!(note.content, "Contenu secret");
+    }
+
+    #[test]
+    fn activity_refreshes_session_and_background_expiry_clears_it() {
+        let sandbox = Sandbox::new();
+        let state = Mutex::new(AppInner { session: Some(sandbox.session()), last_active: Some(Instant::now() - std::time::Duration::from_secs(59)), timeout_secs: 60 });
+        let mut inner = state.lock().unwrap();
+        active(&mut inner).unwrap();
+        assert!(inner.last_active.unwrap().elapsed().as_secs() < 1);
+        assert!(!expire_session(&mut inner));
+        inner.last_active = Some(Instant::now() - std::time::Duration::from_secs(60));
+        assert!(expire_session(&mut inner));
+        assert!(inner.session.is_none());
+        assert!(active(&mut inner).is_err());
+    }
+
+    #[test]
+    fn restoring_an_orphaned_note_reuses_a_recovery_profile() {
+        let mut db = Database::default();
+        let mut first = sample_note();
+        first.trashed_at = Some(Utc::now());
+        let mut second = first.clone();
+        second.id = "n2".into();
+        db.notes = vec![first, second];
+        let restored = restore_trashed_note(&mut db, "n").unwrap();
+        assert!(restored.trashed_at.is_none());
+        assert_eq!(db.profiles.len(), 1);
+        assert_eq!(restored.profile_id, db.profiles[0].id);
+        let second = restore_trashed_note(&mut db, "n2").unwrap();
+        assert_eq!(second.profile_id, restored.profile_id);
+        assert_eq!(db.profiles.len(), 1);
+    }
+
+    #[test]
+    fn attachment_changes_preserve_replace_or_remove_without_partial_updates() {
+        let mut note = sample_note();
+        apply_attachment(&mut note, None, None, false).unwrap();
+        assert_eq!(note.attachment_name.as_deref(), Some("secret.txt"));
+        assert!(apply_attachment(&mut note, Some("invalid".into()), Some("not base64".into()), false).is_err());
+        assert_eq!(note.attachment_name.as_deref(), Some("secret.txt"));
+        apply_attachment(&mut note, Some("new.txt".into()), Some("YQ==".into()), false).unwrap();
+        assert_eq!(note.attachment_data.as_deref(), Some("YQ=="));
+        apply_attachment(&mut note, None, None, true).unwrap();
+        assert!(note.attachment_data.is_none());
+    }
+
+    #[test]
+    fn daily_word_tracking_includes_edits_to_older_notes_and_migrates_legacy_counts() {
+        let today = Utc::now().date_naive().to_string();
+        let mut db = Database::default();
+        let mut note = sample_note();
+        note.created_at = Utc::now() - Duration::days(2);
+        db.notes.push(note);
+        record_words(&mut db, 5);
+        record_words(&mut db, 2);
+        assert_eq!(db.daily_word_counts.as_ref().unwrap()[&today], 7);
+        let mut legacy = Database { daily_word_counts: None, ..Database::default() };
+        let mut note = sample_note();
+        note.created_at = Utc::now();
+        note.content = "un deux trois".into();
+        legacy.notes.push(note);
+        record_words(&mut legacy, 2);
+        assert_eq!(legacy.daily_word_counts.as_ref().unwrap()[&today], 5);
+        record_words(&mut legacy, 0);
+        assert_eq!(legacy.daily_word_counts.as_ref().unwrap()[&today], 5);
+    }
+
+    #[test]
+    fn atomic_write_failure_cleans_up_temporary_files() {
+        let sandbox = Sandbox::new();
+        let target = sandbox.0.join("directory");
+        fs::create_dir(&target).unwrap();
+        assert!(atomic_write(&target, b"data").is_err());
+        assert!(target.is_dir());
+        assert_eq!(fs::read_dir(&sandbox.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn search_date_end_is_exclusive_and_locked_notes_are_not_text_searchable() {
+        let mut note = sample_note();
+        let params = SearchParams { date_from: Some("2026-10-25T00:00:00Z".parse().unwrap()), date_to: Some("2026-10-26T00:00:00Z".parse().unwrap()), ..SearchParams::default() };
+        assert!(note_matches_search(&note, &params, "secret"));
+        note.created_at = params.date_to.unwrap();
+        assert!(!note_matches_search(&note, &params, ""));
+        note.created_at = params.date_from.unwrap();
+        assert!(note_matches_search(&note, &params, ""));
+        note.is_locked = true;
+        assert!(!note_matches_search(&note, &params, "secret"));
+        assert!(note_matches_search(&note, &params, ""));
+        note.trashed_at = Some(Utc::now());
+        assert!(!note_matches_search(&note, &params, ""));
+    }
+
+    #[test]
+    fn dashboard_does_not_count_version_snapshots_as_additional_modifications() {
+        let mut note = sample_note();
+        let now = Utc::now();
+        note.modified_history.push(now);
+        note.versions.push(NoteVersion { title: "old".into(), content: "old".into(), saved_at: now });
+        let (creations, modifications) = daily_activity(&[&note]);
+        assert_eq!(creations.values().sum::<usize>(), 1);
+        assert_eq!(modifications[&now.date_naive()], 1);
+    }
+
+    #[test]
+    fn legacy_locked_note_is_redacted_and_migrates_after_authentication() {
+        let sandbox = Sandbox::new();
+        let mut s = sandbox.session();
+        let mut note = sample_note();
+        let salt = [4; 16];
+        let key = crypto::derive_key("legacy-password", &salt).unwrap();
+        let (nonce, ct) = crypto::encrypt_aes_gcm(&key, note.content.as_bytes()).unwrap();
+        note.is_locked = true;
+        note.content.clear();
+        note.locked_nonce = Some(B64.encode(nonce));
+        note.locked_payload = Some(B64.encode(ct));
+        note.locked_salt = Some(B64.encode(salt));
+        let public = note.for_client();
+        assert!(public.title.is_empty());
+        assert!(public.attachment_data.is_none());
+        s.db.notes.push(note);
+        let opened = decrypt_note(&mut s, "n", "legacy-password").unwrap();
+        assert_eq!(opened.content, "Contenu secret");
+        assert_eq!(opened.title, "Titre secret");
+        assert_eq!(s.db.notes[0].locked_format, 2);
+        assert!(s.db.notes[0].title.is_empty());
+        assert!(s.db.notes[0].attachment_data.is_none());
+        let vf: VaultFile = serde_json::from_slice(&fs::read(&s.vault_path).unwrap()).unwrap();
+        let plain = crypto::decrypt_aes_gcm(&s.key, &B64.decode(vf.nonce).unwrap(), &B64.decode(vf.ciphertext).unwrap()).unwrap();
+        let db: Database = serde_json::from_slice(&plain).unwrap();
+        assert_eq!(db.notes[0].locked_format, 2);
+    }
+
+    #[test]
+    fn backup_names_do_not_mix_vault_prefixes_or_panic_on_unicode() {
+        let path = "/vaults/Perso.snotevault";
+        assert!(belongs_to_vault("Perso-20261025-120000.snotevault.bak", path));
+        assert!(!belongs_to_vault("PersoTravail-20261025-120000.snotevault.bak", path));
+        assert!(!belongs_to_vault("Perso-💡💡💡💡💡.snotevault.bak", path));
+    }
+
+    #[test]
+    fn backups_are_unique_and_rotation_only_removes_this_vaults_files() {
+        let sandbox = Sandbox::new();
+        let session = sandbox.session();
+        let dir = sandbox.0.join("backups");
+        fs::create_dir_all(&dir).unwrap();
+        let foreign = dir.join("PersoTravail-20261025-120000.snotevault.bak");
+        fs::write(&foreign, b"other vault").unwrap();
+        let mut names = HashSet::new();
+        for _ in 0..12 {
+            names.insert(do_backup_in(&session.vault_path.to_string_lossy(), &dir).unwrap());
+        }
+        assert_eq!(names.len(), 12);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 11);
+        assert_eq!(fs::read(foreign).unwrap(), b"other vault");
+    }
+
+    #[test]
+    fn failed_persistence_does_not_commit_database_changes() {
+        let sandbox = Sandbox::new();
+        let mut s = sandbox.session();
+        fs::remove_file(&s.vault_path).unwrap();
+        let result = mutate_database(&mut s, |db| { db.daily_goal_words = 42; Ok(()) });
+        assert!(result.is_err());
+        assert_eq!(s.db.daily_goal_words, 0);
+    }
+
+    #[test]
+    fn restore_validates_before_overwrite_and_requires_safety_backup() {
+        let sandbox = Sandbox::new();
+        let mut s = sandbox.session();
+        let dir = sandbox.0.join("backups");
+        let name = do_backup_in(&s.vault_path.to_string_lossy(), &dir).unwrap();
+        let src = dir.join(name);
+        mutate_database(&mut s, |db| { db.daily_goal_words = 42; Ok(()) }).unwrap();
+        let original = fs::read(&s.vault_path).unwrap();
+        let good_backup = fs::read(&src).unwrap();
+        fs::write(&src, b"invalid JSON").unwrap();
+        assert!(restore_backup_file(&mut s, &src, &dir).is_err());
+        assert_eq!(fs::read(&s.vault_path).unwrap(), original);
+        assert_eq!(s.db.daily_goal_words, 42);
+        let valid: VaultFile = serde_json::from_slice(&good_backup).unwrap();
+        let mut incompatible = valid.clone();
+        incompatible.salt = B64.encode([9; 16]);
+        let mut bad_nonce = valid.clone();
+        bad_nonce.nonce = B64.encode([0; 3]);
+        let mut bad_ciphertext = valid;
+        bad_ciphertext.ciphertext = B64.encode(b"corrupted");
+        for invalid in [incompatible, bad_nonce, bad_ciphertext] {
+            fs::write(&src, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(restore_backup_file(&mut s, &src, &dir).is_err());
+            assert_eq!(fs::read(&s.vault_path).unwrap(), original);
+            assert_eq!(s.db.daily_goal_words, 42);
+        }
+        fs::write(&src, &good_backup).unwrap();
+        let blocked = sandbox.0.join("not-a-directory");
+        fs::write(&blocked, b"blocked").unwrap();
+        assert!(restore_backup_file(&mut s, &src, &blocked).is_err());
+        assert_eq!(fs::read(&s.vault_path).unwrap(), original);
+        restore_backup_file(&mut s, &src, &dir).unwrap();
+        assert_eq!(s.db.daily_goal_words, 0);
+        assert_eq!(fs::read(&s.vault_path).unwrap(), good_backup);
+        assert!(fs::read_dir(dir).unwrap().any(|e| fs::read(e.unwrap().path()).unwrap() == original));
+    }
 }
